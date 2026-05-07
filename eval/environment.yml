@@ -1,0 +1,37 @@
+# environment.yml
+# ================
+# Conda environment for the attention kernel benchmark.
+# Create with:  conda env create -f environment.yml
+# Update with:  conda env update -f environment.yml --prune
+
+name: attn_bench
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11          # flash-attn has best wheel coverage on 3.11
+  - pip
+
+  - pip:
+    # ── PyTorch (CUDA 12.x build; swap cu121 → cu118 if on older toolkit) ──
+    - torch==2.5.1
+    - torchvision==0.20.1
+    - torchaudio==2.5.1
+    --extra-index-url https://download.pytorch.org/whl/cu121
+
+    # ── cuTile (requires CUDA Toolkit 13.1+ on the host; see SETUP.md) ─────
+    - cuda-tile              # stable API  (cuda.tile)
+    # - cuda-tile-experimental  # uncomment if you need autotune APIs
+
+    # ── FlashAttention-2 ────────────────────────────────────────────────────
+    # Installed separately in setup_env.sh because the wheel must match
+    # the exact Python / PyTorch / CUDA triple.  See SETUP.md.
+
+    # ── general utilities ───────────────────────────────────────────────────
+    - ninja                  # parallel C++ compilation (required by flash-attn)
+    - numpy
+    - matplotlib             # optional: for compare_results.py plots
