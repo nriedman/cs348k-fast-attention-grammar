@@ -24,6 +24,17 @@ if nvcc --version 2>/dev/null | grep -q "release 13\."; then
   echo "[setup] CUDA 13.x already installed — skipping."
 else
   echo "[setup] Installing CUDA Toolkit 13.2..."
+
+  # Wait for any background apt/dpkg process (e.g. unattended-upgrades on
+  # first boot) to release its lock before touching the package database.
+  echo "[setup] Waiting for apt lock..."
+  while sudo fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock \
+               /var/cache/apt/archives/lock >/dev/null 2>&1; do
+    echo "[setup]   apt is locked by another process — retrying in 5s..."
+    sleep 5
+  done
+  echo "[setup] Lock free."
+
   # Add the CUDA apt repo for Ubuntu 22.04 (the standard GCE deep learning image)
   wget -q -O /tmp/cuda-keyring.deb \
     https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
@@ -44,9 +55,9 @@ echo "[setup] nvcc: $(nvcc --version | grep release)"
 echo ""
 echo "[setup] Setting up conda environment '${ENV_NAME}'..."
 if conda env list | grep -q "^${ENV_NAME} "; then
-  conda env update --name "${ENV_NAME}" -f environment.yml --prune
+  conda env update --name "${ENV_NAME}" -f environment.yml --prune --solver=classic
 else
-  conda env create -f environment.yml
+  conda env create -f environment.yml --solver=classic
 fi
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
