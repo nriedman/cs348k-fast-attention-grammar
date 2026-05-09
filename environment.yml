@@ -23,10 +23,10 @@ dependencies:
     # Both L4 and A100 ship with CUDA 12.x drivers on GCE standard images.
     # cuTile's CUDA 13.x toolkit is installed system-wide by setup_env.sh and
     # does not need to match the PyTorch CUDA runtime version.
-    - torch==2.5.1
-    - torchvision==0.20.1
-    - torchaudio==2.5.1
-    --extra-index-url https://download.pytorch.org/whl/cu121
+    - --extra-index-url https://download.pytorch.org/whl/cu121
+    - torch==2.5.1+cu121
+    - torchvision==0.20.1+cu121
+    - torchaudio==2.5.1+cu121
 
     # ── cuTile ───────────────────────────────────────────────────────────────
     # Requires CUDA Toolkit 13.1+ installed system-wide (done by setup_env.sh).
