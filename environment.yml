@@ -1,8 +1,10 @@
 # environment.yml
 # ================
 # Conda environment for the attention kernel benchmark.
-# Create with:  conda env create -f environment.yml
-# Update with:  conda env update -f environment.yml --prune
+# Targets GCE VMs (L4 for development, A100 for evaluation).
+#
+# Create:  conda env create -f environment.yml
+# Update:  conda env update -f environment.yml --prune
 
 name: attn_bench
 
@@ -13,25 +15,28 @@ channels:
   - defaults
 
 dependencies:
-  - python=3.11          # flash-attn has best wheel coverage on 3.11
+  - python=3.11          # best flash-attn wheel coverage
   - pip
 
   - pip:
-    # ── PyTorch (CUDA 12.x build; swap cu121 → cu118 if on older toolkit) ──
+    # ── PyTorch (CUDA 12.x build) ────────────────────────────────────────────
+    # Both L4 and A100 ship with CUDA 12.x drivers on GCE standard images.
+    # cuTile's CUDA 13.x toolkit is installed system-wide by setup_env.sh and
+    # does not need to match the PyTorch CUDA runtime version.
     - torch==2.5.1
     - torchvision==0.20.1
     - torchaudio==2.5.1
     --extra-index-url https://download.pytorch.org/whl/cu121
 
-    # ── cuTile (requires CUDA Toolkit 13.1+ on the host; see SETUP.md) ─────
-    - cuda-tile              # stable API  (cuda.tile)
-    # - cuda-tile-experimental  # uncomment if you need autotune APIs
+    # ── cuTile ───────────────────────────────────────────────────────────────
+    # Requires CUDA Toolkit 13.1+ installed system-wide (done by setup_env.sh).
+    - cuda-tile              # stable API (cuda.tile)
+    # - cuda-tile-experimental  # uncomment for autotune APIs
 
-    # ── FlashAttention-2 ────────────────────────────────────────────────────
-    # Installed separately in setup_env.sh because the wheel must match
-    # the exact Python / PyTorch / CUDA triple.  See SETUP.md.
+    # ── FlashAttention-2 ─────────────────────────────────────────────────────
+    # Installed separately in setup_env.sh: wheel filename encodes the exact
+    # (Python, PyTorch, CUDA) triple, so it must be resolved at install time.
 
-    # ── general utilities ───────────────────────────────────────────────────
-    - ninja                  # parallel C++ compilation (required by flash-attn)
+    # ── utilities ────────────────────────────────────────────────────────────
+    - ninja                  # parallel C++ builds (flash-attn fallback)
     - numpy
-    - matplotlib             # optional: for compare_results.py plots
