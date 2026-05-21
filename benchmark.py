@@ -18,7 +18,7 @@ Kernel interface
 ----------------
 The file passed to --kernel must expose a callable with the signature:
     fn(q, k, v) -> out
-where q, k, v, and out are all (B, H, S, D) float CUDA tensors.
+where q, k, v, and out are all (B, S, H, D) float CUDA tensors.
 """
 
 import argparse
@@ -120,7 +120,7 @@ def main():
         print(f"[ERROR] {e}", file=sys.stderr)
         sys.exit(1)
 
-    shape = (args.batch, args.heads, args.seq, args.dim)
+    shape = (args.batch, args.seq, args.heads, args.dim)
     q = torch.randn(shape, dtype=dtype, device="cuda")
     k = torch.randn(shape, dtype=dtype, device="cuda")
     v = torch.randn(shape, dtype=dtype, device="cuda")
