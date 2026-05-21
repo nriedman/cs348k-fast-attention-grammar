@@ -30,22 +30,27 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor
     global memory.
 
     Args:
-        q, k, v: (B, H, S, D) float CUDA tensors
+        q, k, v: (B, S, H, D) float CUDA tensors
 
     Returns:
-        out: (B, H, S, D) float CUDA tensor
+        out: (B, S, H, D) float CUDA tensor
     """
+    # permute to (B, H, S, D) so the batch matmul operates per-head
+    q_ = q.permute(0, 2, 1, 3)                # (B, H, S, D)
+    k_ = k.permute(0, 2, 1, 3)
+    v_ = v.permute(0, 2, 1, 3)
+
     # (S, S) score matrix written to global memory
-    scores = q @ k.transpose(-2, -1)           # (B, H, S, S)
+    scores = q_ @ k_.transpose(-2, -1)        # (B, H, S, S)
 
     # elementwise scale, result written to global memory
     scale = q.shape[-1] ** -0.5
-    scores = scores * scale                    # (B, H, S, S)
+    scores = scores * scale                   # (B, H, S, S)
 
     # row-wise softmax, result written to global memory
-    weights = torch.softmax(scores, dim=-1)    # (B, H, S, S)
+    weights = torch.softmax(scores, dim=-1)   # (B, H, S, S)
 
     # weighted sum, result written to global memory
-    out = weights @ v                          # (B, H, S, D)
+    out = weights @ v_                        # (B, H, S, D)
 
-    return out
+    return out.permute(0, 2, 1, 3)           # (B, S, H, D)
