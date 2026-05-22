@@ -24,7 +24,7 @@ To evaluate the product of a grammar, I wrote a benchmark script in `benchmark.p
 
 The evaluation pipeline is ready for deployment on a Google Cloud Compute GPU-equipped VM. As an initial experiment, I evaluated a naive baseline and FlashAttention2 for sequenc length 2048. They achieved:
 
-- **Naive:** 30.4ms
-- **FlashAttention2:** 3.2ms
+- **Naive:** `4.25 TFLOP/s`
+- **FlashAttention2:** `50.62 TFLOP/s`
 
 The naive and SOTA performance will act as floor and ceiling, respectively, for what a grammar can achieve. By evaluating the grammar at intervals throughout the training cycle, I can track the gains in performance over time. Comparing different training trajectories as they (hopefully) trace from the naive to the SOTA will allow me to measure the effect that grammar design decisions have on how quickly a performant kernel can be found.

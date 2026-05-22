@@ -1,0 +1,21 @@
+{
+  "label": "flash-att",
+  "device": "NVIDIA L4",
+  "config": {
+    "batch": 8,
+    "heads": 16,
+    "seq": 2048,
+    "dim": 64,
+    "dtype": "fp16"
+  },
+  "stats": {
+    "mean_gpu_ms": 2.7150643920898436,
+    "mean_wall_ms": 2.8487127350012997,
+    "median_wall_ms": 2.8328170000122554,
+    "stdev_wall_ms": 0.05852444081348538,
+    "min_wall_ms": 2.779091999997263,
+    "max_wall_ms": 3.0907369999795264,
+    "iters": 200,
+    "tflops": 50.620881726569394
+  }
+}
