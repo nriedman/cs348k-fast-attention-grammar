@@ -564,6 +564,7 @@ def _emit_wrapper(
         "    Skv = k.shape[1]",
         "    dtype  = q.dtype",
         "    device = q.device",
+        "    _stream = cupy.cuda.get_current_stream()",
         "",
         "    # Permute to (B, H, S, D) for tiled computation",
         "    _q = q.permute(0, 2, 1, 3).contiguous()",
@@ -616,12 +617,13 @@ def _emit_wrapper(
                 global_out_args.append(t)
 
         all_pos  = ext_args + global_in_args + global_out_args
-        args_str = ", ".join(all_pos)
-        kw_str   = "H=H, D=D, Sq=Sq, Skv=Skv"
+
+        all_args     = all_pos + ["H", "D", "Sq", "Skv"]
+        args_tup_str = "(" + ", ".join(all_args) + ",)"
 
         ops_label = "+".join(n.op for n in nodes_k)
         L.append(f"    # kernel {kid}: {ops_label}")
-        L.append(f"    {fn_name}({args_str}, {kw_str}, grid={grid_str})")
+        L.append(f"    ct.launch(_stream, {grid_str}, {fn_name}, {args_tup_str})")
 
     L += [
         "",
@@ -666,6 +668,7 @@ def render_source(
         f"# Global tensors : {sorted(globals_)}",
         "",
         "import math",
+        "import cupy",
         "import torch",
         "import cuda.tile as ct",
         "",
