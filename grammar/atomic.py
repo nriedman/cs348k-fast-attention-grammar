@@ -1,43 +1,57 @@
 """
 Atomic grammar for the attention kernel.
 
-This is the starting state of the optimizer: three unfused kernel scopes
-(QK matmul+scale, softmax, PV matmul) with all intermediates in global memory
-and minimal tile sizes. It is correct by construction.
+This is the starting state of the optimizer: eight separate GPU kernels, one per
+compute node, with all intermediates in global memory and no fusion. This is the
+"compute all at root" state from the Halide autoscheduler paper — the maximally
+unfused, obviously-correct baseline from which all rewrites proceed.
+
+Each top-level LoopLevel under ProgramNode is one GPU kernel launch. The loop
+structure for each compute node is derived directly from its declared dimensions:
+  output_dims  → parallel loops (parallel=True)
+  carried_dims → serial loops  (parallel=False)
 
 See AST-spec.md § "The Atomic Grammar (Initial State)" for the full spec.
 """
 
 from __future__ import annotations
 
-from .ast import ComputeNode, DDGEdge, Grammar, KernelScope, LoopLevel, ProgramNode
+from .ast import ComputeNode, DDGEdge, Grammar, LoopLevel, ProgramNode
 
 
 def attention_atomic_grammar() -> Grammar:
     """
     Build and return the atomic attention grammar.
 
-    Tree structure (from spec):
+    Tree structure (8 separate GPU kernels):
 
         ProgramNode
-        ├── KernelScope          # kernel 1: QK matmul + scale
-        │   └── LoopLevel(SEQ_Q, 64, parallel)
-        │       └── LoopLevel(SEQ_KV, 64, parallel)
-        │           ├── Compute(MatMul_QK)
-        │           └── Compute(Scale)
-        ├── KernelScope          # kernel 2: softmax
-        │   └── LoopLevel(SEQ_Q, 64, parallel)
-        │       ├── Compute(RowMax)
-        │       ├── Compute(Subtract)
-        │       ├── Compute(Exp)
-        │       ├── Compute(RowSum)
+        ├── LoopLevel(SEQ_Q, 64, parallel=True)          # kernel 1: MatMul_QK
+        │   └── LoopLevel(SEQ_KV, 64, parallel=True)
+        │       └── Compute(MatMul_QK)
+        ├── LoopLevel(SEQ_Q, 64, parallel=True)          # kernel 2: Scale
+        │   └── LoopLevel(SEQ_KV, 64, parallel=True)
+        │       └── Compute(Scale)
+        ├── LoopLevel(SEQ_Q, 64, parallel=True)          # kernel 3: RowMax
+        │   └── LoopLevel(SEQ_KV, 64, parallel=False)
+        │       └── Compute(RowMax)
+        ├── LoopLevel(SEQ_Q, 64, parallel=True)          # kernel 4: Subtract
+        │   └── LoopLevel(SEQ_KV, 64, parallel=True)
+        │       └── Compute(Subtract)
+        ├── LoopLevel(SEQ_Q, 64, parallel=True)          # kernel 5: Exp
+        │   └── LoopLevel(SEQ_KV, 64, parallel=True)
+        │       └── Compute(Exp)
+        ├── LoopLevel(SEQ_Q, 64, parallel=True)          # kernel 6: RowSum
+        │   └── LoopLevel(SEQ_KV, 64, parallel=False)
+        │       └── Compute(RowSum)
+        ├── LoopLevel(SEQ_Q, 64, parallel=True)          # kernel 7: Divide
+        │   └── LoopLevel(SEQ_KV, 64, parallel=True)
         │       └── Compute(Divide)
-        └── KernelScope          # kernel 3: PV matmul
-            └── LoopLevel(SEQ_Q, 64, parallel)
-                └── LoopLevel(SEQ_KV, 64, parallel)
-                    └── Compute(MatMul_PV)
+        └── LoopLevel(SEQ_Q, 64, parallel=True)          # kernel 8: MatMul_PV
+            └── LoopLevel(SEQ_KV, 64, parallel=False)
+                └── Compute(MatMul_PV)
 
-    DDG (from spec):
+    DDG:
         MatMul_QK -> Scale       [S]
         Scale     -> RowMax      [S_scaled]
         Scale     -> Subtract    [S_scaled]
@@ -49,73 +63,198 @@ def attention_atomic_grammar() -> Grammar:
         Divide    -> MatMul_PV   [A]
     """
     # ------------------------------------------------------------------
-    # Kernel 1: QK matmul + scale
+    # Kernel 1: MatMul_QK
+    # output_dims={SEQ_Q, SEQ_KV}, carried_dims={}
+    # → SEQ_Q(parallel) → SEQ_KV(parallel)
     # ------------------------------------------------------------------
-    matmul_qk = ComputeNode.make("MatMul_QK")
-    scale = ComputeNode.make("Scale")
-
-    k1 = KernelScope(
+    matmul_qk = ComputeNode.make(
+        "MatMul_QK",
+        output_dims={"SEQ_Q", "SEQ_KV"},
+        carried_dims={},
+    )
+    k1 = LoopLevel(
+        dim="SEQ_Q",
+        bound=64,
+        parallel=True,
         children=(
             LoopLevel(
-                dim="SEQ_Q",
-                tile_size=64,
-                loop_type="parallel",
-                children=(
-                    LoopLevel(
-                        dim="SEQ_KV",
-                        tile_size=64,
-                        loop_type="parallel",
-                        children=(matmul_qk, scale),
-                    ),
-                ),
+                dim="SEQ_KV",
+                bound=64,
+                parallel=True,
+                children=(matmul_qk,),
             ),
-        )
+        ),
     )
 
     # ------------------------------------------------------------------
-    # Kernel 2: softmax
+    # Kernel 2: Scale
+    # output_dims={SEQ_Q, SEQ_KV}, carried_dims={}
+    # → SEQ_Q(parallel) → SEQ_KV(parallel)
     # ------------------------------------------------------------------
-    row_max = ComputeNode.make("RowMax")
-    subtract = ComputeNode.make("Subtract")
-    exp = ComputeNode.make("Exp")
-    row_sum = ComputeNode.make("RowSum")
-    divide = ComputeNode.make("Divide")
-
-    k2 = KernelScope(
+    scale = ComputeNode.make(
+        "Scale",
+        output_dims={"SEQ_Q", "SEQ_KV"},
+        carried_dims={},
+    )
+    k2 = LoopLevel(
+        dim="SEQ_Q",
+        bound=64,
+        parallel=True,
         children=(
             LoopLevel(
-                dim="SEQ_Q",
-                tile_size=64,
-                loop_type="parallel",
-                children=(row_max, subtract, exp, row_sum, divide),
+                dim="SEQ_KV",
+                bound=64,
+                parallel=True,
+                children=(scale,),
             ),
-        )
+        ),
     )
 
     # ------------------------------------------------------------------
-    # Kernel 3: PV matmul
+    # Kernel 3: RowMax
+    # output_dims={SEQ_Q}, carried_dims={SEQ_KV}
+    # → SEQ_Q(parallel) → SEQ_KV(serial)
     # ------------------------------------------------------------------
-    matmul_pv = ComputeNode.make("MatMul_PV")
-
-    k3 = KernelScope(
+    row_max = ComputeNode.make(
+        "RowMax",
+        output_dims={"SEQ_Q"},
+        carried_dims={"SEQ_KV"},
+    )
+    k3 = LoopLevel(
+        dim="SEQ_Q",
+        bound=64,
+        parallel=True,
         children=(
             LoopLevel(
-                dim="SEQ_Q",
-                tile_size=64,
-                loop_type="parallel",
-                children=(
-                    LoopLevel(
-                        dim="SEQ_KV",
-                        tile_size=64,
-                        loop_type="parallel",
-                        children=(matmul_pv,),
-                    ),
-                ),
+                dim="SEQ_KV",
+                bound=64,
+                parallel=False,
+                children=(row_max,),
             ),
-        )
+        ),
     )
 
-    program = ProgramNode(children=(k1, k2, k3))
+    # ------------------------------------------------------------------
+    # Kernel 4: Subtract
+    # output_dims={SEQ_Q, SEQ_KV}, carried_dims={}
+    # → SEQ_Q(parallel) → SEQ_KV(parallel)
+    # ------------------------------------------------------------------
+    subtract = ComputeNode.make(
+        "Subtract",
+        output_dims={"SEQ_Q", "SEQ_KV"},
+        carried_dims={},
+    )
+    k4 = LoopLevel(
+        dim="SEQ_Q",
+        bound=64,
+        parallel=True,
+        children=(
+            LoopLevel(
+                dim="SEQ_KV",
+                bound=64,
+                parallel=True,
+                children=(subtract,),
+            ),
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Kernel 5: Exp
+    # output_dims={SEQ_Q, SEQ_KV}, carried_dims={}
+    # → SEQ_Q(parallel) → SEQ_KV(parallel)
+    # ------------------------------------------------------------------
+    exp = ComputeNode.make(
+        "Exp",
+        output_dims={"SEQ_Q", "SEQ_KV"},
+        carried_dims={},
+    )
+    k5 = LoopLevel(
+        dim="SEQ_Q",
+        bound=64,
+        parallel=True,
+        children=(
+            LoopLevel(
+                dim="SEQ_KV",
+                bound=64,
+                parallel=True,
+                children=(exp,),
+            ),
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Kernel 6: RowSum
+    # output_dims={SEQ_Q}, carried_dims={SEQ_KV}
+    # → SEQ_Q(parallel) → SEQ_KV(serial)
+    # ------------------------------------------------------------------
+    row_sum = ComputeNode.make(
+        "RowSum",
+        output_dims={"SEQ_Q"},
+        carried_dims={"SEQ_KV"},
+    )
+    k6 = LoopLevel(
+        dim="SEQ_Q",
+        bound=64,
+        parallel=True,
+        children=(
+            LoopLevel(
+                dim="SEQ_KV",
+                bound=64,
+                parallel=False,
+                children=(row_sum,),
+            ),
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Kernel 7: Divide
+    # output_dims={SEQ_Q, SEQ_KV}, carried_dims={}
+    # → SEQ_Q(parallel) → SEQ_KV(parallel)
+    # ------------------------------------------------------------------
+    divide = ComputeNode.make(
+        "Divide",
+        output_dims={"SEQ_Q", "SEQ_KV"},
+        carried_dims={},
+    )
+    k7 = LoopLevel(
+        dim="SEQ_Q",
+        bound=64,
+        parallel=True,
+        children=(
+            LoopLevel(
+                dim="SEQ_KV",
+                bound=64,
+                parallel=True,
+                children=(divide,),
+            ),
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Kernel 8: MatMul_PV
+    # output_dims={SEQ_Q}, carried_dims={SEQ_KV}
+    # → SEQ_Q(parallel) → SEQ_KV(serial)
+    # ------------------------------------------------------------------
+    matmul_pv = ComputeNode.make(
+        "MatMul_PV",
+        output_dims={"SEQ_Q"},
+        carried_dims={"SEQ_KV"},
+    )
+    k8 = LoopLevel(
+        dim="SEQ_Q",
+        bound=64,
+        parallel=True,
+        children=(
+            LoopLevel(
+                dim="SEQ_KV",
+                bound=64,
+                parallel=False,
+                children=(matmul_pv,),
+            ),
+        ),
+    )
+
+    program = ProgramNode(children=(k1, k2, k3, k4, k5, k6, k7, k8))
 
     # ------------------------------------------------------------------
     # DDG

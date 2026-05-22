@@ -15,7 +15,6 @@ from .ast import (
     ASTNode,
     ComputeNode,
     Grammar,
-    KernelScope,
     LoopLevel,
     ProgramNode,
 )
@@ -71,22 +70,6 @@ def iter_nodes(root: ASTNode) -> Iterator[ASTNode]:
             yield from iter_nodes(child)
 
 
-def scope_of(program: ProgramNode, node: ASTNode) -> KernelScope | None:
-    """Return the KernelScope that contains `node`, or None if not found."""
-    for scope in program.children:
-        if _contains(scope, node):
-            return scope
-    return None
-
-
-def _contains(root: ASTNode, target: ASTNode) -> bool:
-    if root is target:
-        return True
-    if isinstance(root, ComputeNode):
-        return False
-    return any(_contains(c, target) for c in root.children)
-
-
 # ---------------------------------------------------------------------------
 # Structural hashing (ignores node_id)
 # ---------------------------------------------------------------------------
@@ -95,13 +78,13 @@ def _contains(root: ASTNode, target: ASTNode) -> bool:
 def _struct_str(node: ASTNode) -> str:
     """Build a canonical string for the subtree, ignoring node_id."""
     if isinstance(node, ComputeNode):
-        return f"C({node.op})"
+        out = ",".join(sorted(node.output_dims))
+        car = ",".join(sorted(node.carried_dims))
+        return f"C({node.op},out=[{out}],car=[{car}])"
     if isinstance(node, LoopLevel):
         kids = ",".join(_struct_str(c) for c in node.children)
-        return f"L({node.dim},{node.tile_size},{node.loop_type},[{kids}])"
-    if isinstance(node, KernelScope):
-        kids = ",".join(_struct_str(c) for c in node.children)
-        return f"K([{kids}])"
+        par = "par" if node.parallel else "ser"
+        return f"L({node.dim},{node.bound},{par},[{kids}])"
     if isinstance(node, ProgramNode):
         kids = ",".join(_struct_str(c) for c in node.children)
         return f"P([{kids}])"
@@ -138,9 +121,7 @@ def _replace_in_node(node: ASTNode, target: ASTNode, replacement: ASTNode) -> AS
     if all(nc is oc for nc, oc in zip(new_children, node.children)):
         return node
     if isinstance(node, LoopLevel):
-        return LoopLevel(node.dim, node.tile_size, node.loop_type, new_children)
-    if isinstance(node, KernelScope):
-        return KernelScope(new_children)
+        return LoopLevel(node.dim, node.bound, node.parallel, new_children)
     if isinstance(node, ProgramNode):
         return ProgramNode(new_children)
     raise TypeError(f"Unknown node type: {type(node)}")
@@ -184,22 +165,22 @@ def _fmt_node(node: ASTNode, prefix: str, last: bool, lines: list[str]) -> None:
         for i, child in enumerate(node.children):
             _fmt_node(child, "", i == len(node.children) - 1, lines)
         return
-    if isinstance(node, KernelScope):
-        lines.append(f"{prefix}{connector}KernelScope")
-        child_prefix = prefix + ("    " if last else "│   ")
-        for i, child in enumerate(node.children):
-            _fmt_node(child, child_prefix, i == len(node.children) - 1, lines)
-        return
     if isinstance(node, LoopLevel):
+        par_str = "parallel" if node.parallel else "serial"
         lines.append(
             f"{prefix}{connector}LoopLevel(dim={node.dim}, "
-            f"tile_size={node.tile_size}, {node.loop_type})"
+            f"bound={node.bound}, {par_str})"
         )
         child_prefix = prefix + ("    " if last else "│   ")
         for i, child in enumerate(node.children):
             _fmt_node(child, child_prefix, i == len(node.children) - 1, lines)
         return
     if isinstance(node, ComputeNode):
-        lines.append(f"{prefix}{connector}Compute({node.op})")
+        out = "{" + ", ".join(sorted(node.output_dims)) + "}"
+        car = "{" + ", ".join(sorted(node.carried_dims)) + "}"
+        lines.append(
+            f"{prefix}{connector}Compute({node.op}, "
+            f"output_dims={out}, carried_dims={car})"
+        )
         return
     raise TypeError(f"Unknown node type: {type(node)}")

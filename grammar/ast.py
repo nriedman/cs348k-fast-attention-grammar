@@ -4,12 +4,21 @@ Core AST node types and the Grammar container.
 Design notes:
 - All nodes are frozen dataclasses with __slots__ for fast attribute access and
   value-based hashing. Immutability enables structural sharing across rewrites.
-- Parameters (dim, tile_size) live directly on LoopLevel nodes — no separate
-  param dict — because the parameter space IS the node structure here.
+- KernelScope is removed. GPU kernel boundaries are implicit: each direct child
+  LoopLevel of ProgramNode is one GPU kernel launch, executed in order.
+- LoopLevel uses `bound` (number of iterations; power of 2) and `parallel: bool`
+  instead of the old `tile_size` and `loop_type`.
+- ComputeNode carries `output_dims` and `carried_dims` declared by the grammar
+  author. These are the only op-semantic knowledge the framework requires:
+    output_dims:  frozenset of dimension names that appear in the op's output
+                  (determines write address per loop iteration).
+    carried_dims: frozenset of dimension names over which the op accumulates
+                  state across loop iterations (requires a serial loop; the
+                  renderer emits an initialised accumulator before the loop
+                  and += inside it).
 - The DDG is stored alongside the tree in Grammar. Rewrite rules mutate the
   tree but never the DDG.
 - ComputeNode carries a node_id (monotonically increasing int) for DDG identity.
-  Two ComputeNodes with the same op but different node_ids are different nodes.
 - Grammar.node_index is a dict mapping node_id -> ComputeNode, built once on
   construction and reused for O(1) DDG lookups.
 """
@@ -23,9 +32,8 @@ from typing import Union
 # Type aliases
 # ---------------------------------------------------------------------------
 
-ASTNode = Union["ProgramNode", "KernelScope", "LoopLevel", "ComputeNode"]
+ASTNode = Union["ProgramNode", "LoopLevel", "ComputeNode"]
 LoopChild = Union["LoopLevel", "ComputeNode"]
-KernelChild = Union["LoopLevel", "ComputeNode"]
 
 # ---------------------------------------------------------------------------
 # Node-ID counter (module-level, intentionally simple)
@@ -56,18 +64,35 @@ class ComputeNode:
     Children: none. Data flow is encoded in the DDG, not the tree.
 
     Tags:
-        op:      identifies the primitive (e.g. 'MatMul_QK', 'RowMax').
-        node_id: unique identity for DDG edge references. Not part of
-                 structural equality / tree hash — see utils.tree_hash.
+        op:           identifies the primitive (e.g. 'MatMul_QK', 'RowMax').
+        node_id:      unique identity for DDG edge references.
+        output_dims:  dimensions that appear in this op's output tensor.
+                      A parallel loop over dim D writes to a different output
+                      slice each iteration; D must be in output_dims.
+        carried_dims: dimensions over which this op accumulates across loop
+                      iterations. A loop over dim D where D ∈ carried_dims
+                      must be serial (parallel=False). The renderer emits an
+                      accumulator initialised before the loop and += inside it.
     """
 
     op: str
     node_id: int
+    output_dims: frozenset  # frozenset[str]
+    carried_dims: frozenset  # frozenset[str]
 
     @staticmethod
-    def make(op: str) -> "ComputeNode":
+    def make(
+        op: str,
+        output_dims: tuple | set | frozenset = (),
+        carried_dims: tuple | set | frozenset = (),
+    ) -> "ComputeNode":
         """Create a new ComputeNode with a fresh unique node_id."""
-        return ComputeNode(op=op, node_id=_next_id())
+        return ComputeNode(
+            op=op,
+            node_id=_next_id(),
+            output_dims=frozenset(output_dims),
+            carried_dims=frozenset(carried_dims),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -81,55 +106,47 @@ class LoopLevel:
     A single tiled loop over one logical dimension.
 
     Parameters:
-        dim:       logical dimension name (e.g. 'SEQ_Q', 'SEQ_KV', 'HEAD_DIM').
-        tile_size: elements processed per iteration; must be a power of 2.
-        loop_type: 'parallel' | 'reduction'.
-        children:  tuple of LoopLevel or ComputeNode, in execution order.
+        dim:      logical dimension name (e.g. 'SEQ_Q', 'SEQ_KV', 'HEAD_DIM').
+        bound:    number of iterations; must be a power of 2.
+                  SplitLoop produces two nested LoopLevels where
+                  outer.bound * inner.bound == original.bound.
+        parallel: True  → parallelised across GPU threads/blocks (maps to
+                          ct.bid / grid dim in the renderer).
+                  False → serial loop in the kernel body (for-loop).
+                  Changed by the Parallelize / Serialize rewrite rules.
+        children: tuple of LoopLevel or ComputeNode, in execution order.
     """
 
     dim: str
-    tile_size: int
-    loop_type: str  # 'parallel' | 'reduction'
+    bound: int
+    parallel: bool
     children: tuple  # tuple[LoopChild, ...]
 
     def __post_init__(self) -> None:
-        if self.loop_type not in ("parallel", "reduction"):
-            raise ValueError(
-                f"loop_type must be 'parallel' or 'reduction', got {self.loop_type!r}"
-            )
-        if not _is_pow2(self.tile_size):
-            raise ValueError(f"tile_size must be a power of 2, got {self.tile_size}")
+        if not _is_pow2(self.bound):
+            raise ValueError(f"bound must be a power of 2, got {self.bound}")
         if not self.children:
             raise ValueError("LoopLevel must have at least one child")
 
 
 @dataclass(frozen=True, slots=True)
-class KernelScope:
-    """
-    One GPU kernel launch. Grid/block dims are derived by the renderer from the
-    enclosed LoopLevel structure; they are not stored in the AST.
-
-    Children: one or more LoopLevel (or Compute) nodes.
-    """
-
-    children: tuple  # tuple[KernelChild, ...]
-
-    def __post_init__(self) -> None:
-        if not self.children:
-            raise ValueError("KernelScope must have at least one child")
-
-
-@dataclass(frozen=True, slots=True)
 class ProgramNode:
     """
-    Root of the AST. Holds one or more KernelScope nodes in execution order.
+    Root of the AST.
+
+    Each direct child LoopLevel represents one GPU kernel launch, executed in
+    order. When there is only one child, the entire computation runs in a single
+    kernel. The renderer derives grid/block dimensions from the LoopLevel
+    structure; they are not stored in the AST.
+
+    Children: one or more LoopLevel nodes.
     """
 
-    children: tuple  # tuple[KernelScope, ...]
+    children: tuple  # tuple[LoopLevel, ...]
 
     def __post_init__(self) -> None:
         if not self.children:
-            raise ValueError("ProgramNode must have at least one KernelScope")
+            raise ValueError("ProgramNode must have at least one child")
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +164,9 @@ class DDGEdge:
         tensor:      name of the tensor flowing along this edge.
 
     The DDG is always a DAG. Rewrite rules never modify it.
+    If producer and consumer are in the same kernel (share a root-to-leaf
+    path in the tree), the tensor may live in shared memory or registers.
+    Otherwise it must be materialised to global memory.
     """
 
     producer_id: int
@@ -177,20 +197,12 @@ class Grammar:
     def __post_init__(self) -> None:
         self._build_index(self.program)
 
-    # ------------------------------------------------------------------
-    # Index construction
-    # ------------------------------------------------------------------
-
     def _build_index(self, node: ASTNode) -> None:
         if isinstance(node, ComputeNode):
             self.node_index[node.node_id] = node
         else:
             for child in node.children:
                 self._build_index(child)
-
-    # ------------------------------------------------------------------
-    # DDG query helpers (O(|ddg|) — ddg is small in practice)
-    # ------------------------------------------------------------------
 
     def producers_of(self, consumer_id: int) -> list[DDGEdge]:
         """All DDG edges whose consumer is consumer_id."""
@@ -202,9 +214,7 @@ class Grammar:
 
     def transitive_producers(self, node_id: int, within: set[int] | None = None) -> set[int]:
         """
-        Return the set of node_ids that node_id transitively depends on
-        (i.e. all ancestor producers in the DDG).
-
+        Return the set of node_ids that node_id transitively depends on.
         If `within` is provided, only follow edges whose producer_id is in that set.
         """
         result: set[int] = set()
