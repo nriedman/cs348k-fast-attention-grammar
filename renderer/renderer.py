@@ -621,7 +621,7 @@ def _emit_wrapper(
 
         ops_label = "+".join(n.op for n in nodes_k)
         L.append(f"    # kernel {kid}: {ops_label}")
-        L.append(f"    {fn_name}[{grid_str}]({args_str}, {kw_str})")
+        L.append(f"    {fn_name}({args_str}, {kw_str}, grid={grid_str})")
 
     L += [
         "",
