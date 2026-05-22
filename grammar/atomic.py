@@ -1,13 +1,15 @@
 """
 Atomic grammar for the attention kernel.
 
-This is the starting state of the optimizer: eight separate GPU kernels, one per
-compute node, with all intermediates in global memory and no fusion. This is the
-"compute all at root" state from the Halide autoscheduler paper — the maximally
-unfused, obviously-correct baseline from which all rewrites proceed.
+This is the starting state of the optimizer: a single GPU kernel containing
+eight sequential stages, one per compute node, with all intermediates in global
+memory and no fusion. This is the "compute all at root" state from the Halide
+autoscheduler paper — the maximally unfused, obviously-correct baseline from
+which all rewrites proceed.
 
-Each top-level LoopLevel under ProgramNode is one GPU kernel launch. The loop
-structure for each compute node is derived directly from its declared dimensions:
+The entire ProgramNode is one kernel launch. Each top-level LoopLevel child is
+one stage within that kernel; an implicit barrier synchronizes threads between
+stages. The loop structure for each stage is derived from its declared dims:
   output_dims  → parallel loops (parallel=True)
   carried_dims → serial loops  (parallel=False)
 
@@ -19,36 +21,52 @@ from __future__ import annotations
 from .ast import ComputeNode, DDGEdge, Grammar, LoopLevel, ProgramNode
 
 
-def attention_atomic_grammar() -> Grammar:
+def attention_atomic_grammar(
+    seq_q: int = 2048,
+    seq_kv: int = 2048,
+) -> Grammar:
     """
     Build and return the atomic attention grammar.
 
-    Tree structure (8 separate GPU kernels):
+    Parameters:
+        seq_q:  number of query positions (SEQ_Q loop bound).
+        seq_kv: number of key/value positions (SEQ_KV loop bound).
 
-        ProgramNode
-        ├── LoopLevel(SEQ_Q, 64, parallel=True)          # kernel 1: MatMul_QK
-        │   └── LoopLevel(SEQ_KV, 64, parallel=True)
+    Both values must be powers of 2 to satisfy LoopLevel's bound invariant.
+
+    Tree structure (single GPU kernel, 8 sequential stages with barriers):
+
+        ProgramNode                                          # one kernel launch
+        ├── LoopLevel(SEQ_Q, seq_q, parallel=True)          # stage 1: MatMul_QK
+        │   └── LoopLevel(SEQ_KV, seq_kv, parallel=True)
         │       └── Compute(MatMul_QK)
-        ├── LoopLevel(SEQ_Q, 64, parallel=True)          # kernel 2: Scale
-        │   └── LoopLevel(SEQ_KV, 64, parallel=True)
+        ├── <barrier>
+        ├── LoopLevel(SEQ_Q, seq_q, parallel=True)          # stage 2: Scale
+        │   └── LoopLevel(SEQ_KV, seq_kv, parallel=True)
         │       └── Compute(Scale)
-        ├── LoopLevel(SEQ_Q, 64, parallel=True)          # kernel 3: RowMax
-        │   └── LoopLevel(SEQ_KV, 64, parallel=False)
+        ├── <barrier>
+        ├── LoopLevel(SEQ_Q, seq_q, parallel=True)          # stage 3: RowMax
+        │   └── LoopLevel(SEQ_KV, seq_kv, parallel=False)
         │       └── Compute(RowMax)
-        ├── LoopLevel(SEQ_Q, 64, parallel=True)          # kernel 4: Subtract
-        │   └── LoopLevel(SEQ_KV, 64, parallel=True)
+        ├── <barrier>
+        ├── LoopLevel(SEQ_Q, seq_q, parallel=True)          # stage 4: Subtract
+        │   └── LoopLevel(SEQ_KV, seq_kv, parallel=True)
         │       └── Compute(Subtract)
-        ├── LoopLevel(SEQ_Q, 64, parallel=True)          # kernel 5: Exp
-        │   └── LoopLevel(SEQ_KV, 64, parallel=True)
+        ├── <barrier>
+        ├── LoopLevel(SEQ_Q, seq_q, parallel=True)          # stage 5: Exp
+        │   └── LoopLevel(SEQ_KV, seq_kv, parallel=True)
         │       └── Compute(Exp)
-        ├── LoopLevel(SEQ_Q, 64, parallel=True)          # kernel 6: RowSum
-        │   └── LoopLevel(SEQ_KV, 64, parallel=False)
+        ├── <barrier>
+        ├── LoopLevel(SEQ_Q, seq_q, parallel=True)          # stage 6: RowSum
+        │   └── LoopLevel(SEQ_KV, seq_kv, parallel=False)
         │       └── Compute(RowSum)
-        ├── LoopLevel(SEQ_Q, 64, parallel=True)          # kernel 7: Divide
-        │   └── LoopLevel(SEQ_KV, 64, parallel=True)
+        ├── <barrier>
+        ├── LoopLevel(SEQ_Q, seq_q, parallel=True)          # stage 7: Divide
+        │   └── LoopLevel(SEQ_KV, seq_kv, parallel=True)
         │       └── Compute(Divide)
-        └── LoopLevel(SEQ_Q, 64, parallel=True)          # kernel 8: MatMul_PV
-            └── LoopLevel(SEQ_KV, 64, parallel=False)
+        ├── <barrier>
+        └── LoopLevel(SEQ_Q, seq_q, parallel=True)          # stage 8: MatMul_PV
+            └── LoopLevel(SEQ_KV, seq_kv, parallel=False)
                 └── Compute(MatMul_PV)
 
     DDG:
@@ -74,12 +92,12 @@ def attention_atomic_grammar() -> Grammar:
     )
     k1 = LoopLevel(
         dim="SEQ_Q",
-        bound=64,
+        bound=seq_q,
         parallel=True,
         children=(
             LoopLevel(
                 dim="SEQ_KV",
-                bound=64,
+                bound=seq_kv,
                 parallel=True,
                 children=(matmul_qk,),
             ),
@@ -98,12 +116,12 @@ def attention_atomic_grammar() -> Grammar:
     )
     k2 = LoopLevel(
         dim="SEQ_Q",
-        bound=64,
+        bound=seq_q,
         parallel=True,
         children=(
             LoopLevel(
                 dim="SEQ_KV",
-                bound=64,
+                bound=seq_kv,
                 parallel=True,
                 children=(scale,),
             ),
@@ -122,12 +140,12 @@ def attention_atomic_grammar() -> Grammar:
     )
     k3 = LoopLevel(
         dim="SEQ_Q",
-        bound=64,
+        bound=seq_q,
         parallel=True,
         children=(
             LoopLevel(
                 dim="SEQ_KV",
-                bound=64,
+                bound=seq_kv,
                 parallel=False,
                 children=(row_max,),
             ),
@@ -146,12 +164,12 @@ def attention_atomic_grammar() -> Grammar:
     )
     k4 = LoopLevel(
         dim="SEQ_Q",
-        bound=64,
+        bound=seq_q,
         parallel=True,
         children=(
             LoopLevel(
                 dim="SEQ_KV",
-                bound=64,
+                bound=seq_kv,
                 parallel=True,
                 children=(subtract,),
             ),
@@ -170,12 +188,12 @@ def attention_atomic_grammar() -> Grammar:
     )
     k5 = LoopLevel(
         dim="SEQ_Q",
-        bound=64,
+        bound=seq_q,
         parallel=True,
         children=(
             LoopLevel(
                 dim="SEQ_KV",
-                bound=64,
+                bound=seq_kv,
                 parallel=True,
                 children=(exp,),
             ),
@@ -194,12 +212,12 @@ def attention_atomic_grammar() -> Grammar:
     )
     k6 = LoopLevel(
         dim="SEQ_Q",
-        bound=64,
+        bound=seq_q,
         parallel=True,
         children=(
             LoopLevel(
                 dim="SEQ_KV",
-                bound=64,
+                bound=seq_kv,
                 parallel=False,
                 children=(row_sum,),
             ),
@@ -218,12 +236,12 @@ def attention_atomic_grammar() -> Grammar:
     )
     k7 = LoopLevel(
         dim="SEQ_Q",
-        bound=64,
+        bound=seq_q,
         parallel=True,
         children=(
             LoopLevel(
                 dim="SEQ_KV",
-                bound=64,
+                bound=seq_kv,
                 parallel=True,
                 children=(divide,),
             ),
@@ -242,12 +260,12 @@ def attention_atomic_grammar() -> Grammar:
     )
     k8 = LoopLevel(
         dim="SEQ_Q",
-        bound=64,
+        bound=seq_q,
         parallel=True,
         children=(
             LoopLevel(
                 dim="SEQ_KV",
-                bound=64,
+                bound=seq_kv,
                 parallel=False,
                 children=(matmul_pv,),
             ),

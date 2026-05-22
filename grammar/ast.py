@@ -4,8 +4,9 @@ Core AST node types and the Grammar container.
 Design notes:
 - All nodes are frozen dataclasses with __slots__ for fast attribute access and
   value-based hashing. Immutability enables structural sharing across rewrites.
-- KernelScope is removed. GPU kernel boundaries are implicit: each direct child
-  LoopLevel of ProgramNode is one GPU kernel launch, executed in order.
+- The entire ProgramNode executes as a single GPU kernel launch. Sibling
+  LoopLevel children of ProgramNode run sequentially within that kernel, with
+  an implicit barrier between each sibling to enforce data-dependency ordering.
 - LoopLevel uses `bound` (number of iterations; power of 2) and `parallel: bool`
   instead of the old `tile_size` and `loop_type`.
 - ComputeNode carries `output_dims` and `carried_dims` declared by the grammar
@@ -132,12 +133,13 @@ class LoopLevel:
 @dataclass(frozen=True, slots=True)
 class ProgramNode:
     """
-    Root of the AST.
+    Root of the AST. The entire ProgramNode maps to a single GPU kernel launch.
 
-    Each direct child LoopLevel represents one GPU kernel launch, executed in
-    order. When there is only one child, the entire computation runs in a single
-    kernel. The renderer derives grid/block dimensions from the LoopLevel
-    structure; they are not stored in the AST.
+    Direct child LoopLevel nodes execute sequentially within that kernel. An
+    implicit synchronization barrier is inserted between each sibling to ensure
+    that intermediate tensors written by one stage are visible to the next.
+    The renderer derives grid/block dimensions from the LoopLevel structure;
+    they are not stored in the AST.
 
     Children: one or more LoopLevel nodes.
     """
