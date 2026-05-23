@@ -37,7 +37,7 @@ When a kernel launches, it follows CUDA by assigning work to a 3D grid of blocks
 
 By exploring the two stages of the pipeline, we can better understand how loops over tiles pervade the `cuTile` kernel design process.
 
-The first operation (stage 2 in the pipeline, my apologies) is a simple element-wise addition of two matrices. The kernel launches a grid of blocks, each of which is assigned a tile of the output to compute. The data dependency of the compute operation over the tile reveals what input tiles must be loaded to shared memory. Because the operation is element-wise, a single tile of the output depends on a single, corresponding tile in each input -- these are fetched from global memory before the compute operation. At the end of the kernel, the output tile is stored to global memory. The block grid each computes a disjoint tile, and the output is produced.
+The first operation (stage 2 in the pipeline, my apologies) is a simple element-wise addition of two matrices. The kernel launches a grid of blocks, each of which is assigned a tile of the output to compute. The data dependency of the compute operation over the tile reveals what input tiles must be loaded to shared memory. Because the operation is element-wise, a single tile of the output depends on a single, corresponding tile in each input -- these are fetched from global memory before the compute operation. At the end of the kernel, the output tile is stored to global memory. Each block in the grid computes a disjoint tile, together producing the entire output.
 
 To summarize, we trivially identified a correct kernel by first mapping output to input tiles through the compute operation, then issuing loads and stores as required before and after the computation. In pseudocode:
 
@@ -52,7 +52,7 @@ Store(output, bid.x, bid.y, TILE_X, TILE_Y, output_)    // store the result coop
 
 This is a basic, generalizable pattern.
 
-The second operation (stage 1 in the pipeline, my apologies) illustrates what happens when the data dependency is non-trivial. In this case, we are performing a matrix multiplication, so a single tile in the output depends on entire rows and columns in the first and second input, respectively. For the trivial example, we load a large tile from each input that spans the entire range of dependent indices. However, for large inputs, this will quickly fill the shared memory on device (an L4 GPU has 48 KB of shared memory by default).
+The second operation (stage 1 in the pipeline, my apologies) illustrates what happens when the data dependency is non-trivial. In this case, we are performing a matrix multiplication, so a single tile in the output depends on entire rows and columns in the first and second input, respectively. For the trivial example, we load a large tile from each input that spans the entire range of dependent indices. However, for large inputs, this will quickly fill the shared memory on device (an L4 GPU has 48 KB of shared memory by default -- not much!).
 
 This brings us to our first idea on how to design a better kernel: split the `K` dimension into `K / TILE_K` tiles of size `TILE_K`, and compute partial matrix multiplications of the inputs of the more-manageable size of `(TILE_X, TILE_K)` and `(TILE_K, TILE_Y)`. By delegating fine-tune control of threads and warp blocks to the compiler, the programmer is free to make decisions in terms of which dimension to break into tiles, and how big those tiles should be.
 
@@ -90,11 +90,13 @@ This illustrates a key insight: just as the `@ct.kernel` is analogous to a paral
 
 I did something slightly deceitful in the previous example. When transitioning to using an accumulator, I raised the terminal `Store` outside the bounds of the loop and into a higher scope. Why was that allowed? It was, but don't take my word for it.
 
-A load or a store can be hoisted up out of a loop or sunk into a loop. By changing the level at which the memory operation is initiated, the characteristics of memory traffic between global and shared memory change. Making decisions about when to materialize a tile is an extremely important way to optimize performance: sometimes it's better to load in one big buffer, then computer small sections of it in the body of the sequential loop. Other times, it's better to load many smaller tiles. These tradeoffs are captured in the basic decision: At what scope should I initiate the load or store?
+A load or a store can be hoisted up out of a loop or sunk into a loop. By changing the level at which the memory operation is initiated, the characteristics of memory traffic between global and shared memory change. Making decisions about when to materialize a tile is an extremely important way to optimize performance: sometimes it's better to load in one big buffer, then compute small sections of it in the body of the sequential loop. Other times, it's better to load many smaller tiles. These tradeoffs are captured in the basic question: **At what scope should I initiate the load or store?**
 
 The level of the load/store determines its memory footprint in shared memory. The memory footprint is a function of data dependency: in a sequential loop like the matrix multiplication example above, hoisting the load would require loading in the entire row once again, since the load offset in the loop depends on the iteration of the loop. The store, on the other hand, could be hoisted without changing its footprint because the offset in the destination did not depend on the iteration index.
 
 The memory footprint and data dependency, respectively, enforce upper and lower bounds on where a memory operation can be placed. The higher the scope, the larger the potential memory footprint of a load. Shared memory is finite, and so a load could fail if it attempts to loard more data than is available. The lower the loop placement, the narrower the scope that the memory operation is available in. If a Load is sunk lower than a compute node that depends on it, the compute node has no initialized memory to read from.
+
+Overall, the case study in `dev/playground.py` illustrates key concepts about a) what the conceptual components of a `cuTile` grammar are; and b) how design decisions can be framed as mechanically adjusting the structure and parameters of those components. Let's formalize this.
 
 ### The Resulting Grammar
 
@@ -137,11 +139,16 @@ These rewrite rules are designed to guarantee correctness by construction -- no 
 
 Together, these rules capture 80% of the design decisions that go in to writing a fast kernel. I designed them to be expressive enough to give an optimizer ample room to explore, but narrow and orthogonal enough to not dilute the search space with redundant actions. They are well on their way to obeying the principles laid out in [*Design for Descent: What Makes a Shape Grammar Easy to Optimize?*](https://dl.acm.org/doi/pdf/10.1145/3757377.3764004), and form a principled foundation on which to build the rest of the project.
 
+> [!Note]
+> From my work so far, it is clear to see that kernels derived from my grammars will not reach the level of _FlashAttention2_. The authors of _FlastAttention2_ leveraged a wonderful algebraic property of exponentials to compute Softmax online, removing the need to write the scores to global memory. Unfortunately, this technique requires a) changing what the math / algorithm does; and b) supporting inter-iteration dependencies (e.g. the computation at _k + 1_ is a function of the computation at _k_). This is a whole can of worms that (while extremely interesting) fall well within the Future Work section for the purposes of this project.
+
 ### Open Questions
 
 A few questions remain. For one, I would like to design an inverse to the **Merge** rewrite rule. **Merge** is loop fusion -- it would be nice to support loop fission with a **Split** rule. This would both allow me to fully test **Reversability** as a design principle and also give the optimizer more tools to work with
 
 For another, I still need to build the "renderer" (compiler) that takes a grammar as defined above an outputs a cuTile kernel. Then, I need to build the optimization pipeline that takes an atomic grammar and applies Stochastic Rewrite Descent to improve performance. Now that the grammar is well defined, the next steps are clear and should be straight forward.
+
+Finally, while it's clear that attention is more complicated than the toy pipeline in `dev/playground.py`, it's not by much. By first stepping through a simple case study, I was able to methodically identify design principles and programming models that informed a rigorous, polished grammar. Attention is the same thing, just with 8 stages instead of 2.
 
 ## Evaluation
 
