@@ -120,15 +120,28 @@ Now that we have an atomic grammar, we need to talk about how to rewrite them.
 
 ### Rewrite Rules
 
-| **Rule** | **Effect** | **Input(s)** | **Constraint(s)** |
+Based on the case study explored above, we can write down a few general rewrite rules:
+
+| **Rule** | **Input(s)** | **Effect** | **Constraint(s)** |
 | --- | --- | --- | --- |
-| **Hoist** | | | |
-| **Sink** | | | |
-| **Subtile** | | | |
-| **Unwrap** | | | |
-| **InterchangeLoop** | | | |
-| **Merge** | | | |
-| **EliminateRoundTrip** | | |
+| **Hoist** | _memop_: **Load** or **Store**, _loop_: **SequentialLoop** | Lift _memop_ out of _loop_'s scope. The tile shape is expanded to have capacity for the entire memory footprint defined by the output tiles computed over all iterations of _loop_, if applicable. A **Load** is placed before _loop_ in the new scope, and a **Store** is placed afterwards. | Sum of all buffers implied by _memop_ must fit in shared memory. _loop_ must be an immediate parent of _memop_ in the grammar AST. The body of _loop_ cannot be empty after this operation. |
+| **Sink** | _memop_: **Load** or **Store**, _loop_: **SequentialLoop** | The inverse of **Hoist**. Lowers _memop_ into the body of _loop_, constricting _memop_'s shape as applicable by the narrowed data dependency. _memop_ is placed at either the beginning or the end of the loop body (whichever is closer to where it was before the sink). | A load must be at or above the loop level of the highest compute node that reads from it. _loop_ must be in the same loop scope as _memop_ (they share a parent in the AST), and they must be directly adjacent. |
+| **Subtile** | _dim_: **Int**, _comp_: **Computation** | Break up _comp_ into tiles along _dim_ by wrapping the **Computation** in a **SequentialLoop**. The shape of the inputs to _comp_ are changed to reflect the new tiling if the input has dimension _dim_. Initially, the tile size of the new dimension is set to the size of _dim_ so that the loop has only one iteration. If the output region doesn't change across loop iterations, set the _accumulate_ flag in **Compute** and insert accumulator boilderplate around the new loop. | Can only be applied to a **Compute** node (the body of the new loop is just that operation). _dim_ must be a dimension that exists in the scope of the enclosing loop. There must be space in shared memory for any necessary accumulator. (Optional) _dim_ must appear in at least one input or ouptut shape. |
+| **Unwrap** | _loop_: **SequentialLoop** | Remoes a **SequentialLoop**, promoting its contents back to the enclosing scope. | The change must be trivial, so _loop_ must only contain a single **Compute** node in its body, and _loop_'s tile size must be equal to its dimension size s.t. there is only one iteration of the loop. |
+| **InterchangeLoop** | _inner_: **SequentialLoop**, _outer_: **SequentialLoop** | Swaps the nested _inner_ and _outer_ loops so that _inner_ replaces _outer_, and vice versa. | The two **SequentialLoops** must only contain a single **Compute** node in the body of _inner_. |
+| **Reorder** | _first_: any **Node**, _second_: any **Node** | Swap the exectution order of two adjacent **Node**s in the same scope. | There must be no dependency between the nodes, or any sub-nodes in the case of loops. Shared memory must be able to accommodate the change. |
+| **Merge** | _a_: **SequentialLoop** or **ParallelLoop**, _b_: **SequantialLoop** or **ParallelLoop** | Combine two adjacent loops of the same kind into one loop. The body of the resulting loop will be the body of _a_ concatenated with the body of _b_ in relative execution order. | The loops must be adjacent. The loops must have the same tile dimensions and sizes. For parallel loops, the output of _a_ must be consumed by _b_ **and no other Node**. _b_ must be the sole consumer of the product of _a_. |
+| **EliminateRoundTrip** | _send_: **Store**, _receive_: **Load** | When _receive_ immediately follows _send_ over the same tile, remove both nodes. | _send_ must immediately precede _receive_. They must be memory operations over the same tensor, at the same offset, with the same tile shape. |
+ 
+These rewrite rules are designed to guarantee correctness by construction -- no rewrite rule changes _what_ is computed, only _what tile_ work is assigned to and _when_.
+
+Together, these rules capture 80% of the design decisions that go in to writing a fast kernel. I designed them to be expressive enough to give an optimizer ample room to explore, but narrow and orthogonal enough to not dilute the search space with redundant actions. They are well on their way to obeying the principles laid out in [*Design for Descent: What Makes a Shape Grammar Easy to Optimize?*](https://dl.acm.org/doi/pdf/10.1145/3757377.3764004), and form a principled foundation on which to build the rest of the project.
+
+### Open Questions
+
+A few questions remain. For one, I would like to design an inverse to the **Merge** rewrite rule. **Merge** is loop fusion -- it would be nice to support loop fission with a **Split** rule. This would both allow me to fully test **Reversability** as a design principle and also give the optimizer more tools to work with
+
+For another, I still need to build the "renderer" (compiler) that takes a grammar as defined above an outputs a cuTile kernel. Then, I need to build the optimization pipeline that takes an atomic grammar and applies Stochastic Rewrite Descent to improve performance. Now that the grammar is well defined, the next steps are clear and should be straight forward.
 
 ## Evaluation
 
