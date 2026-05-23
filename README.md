@@ -160,3 +160,11 @@ The evaluation pipeline is ready for deployment on a Google Cloud Compute GPU-eq
 - **FlashAttention2:** `50.62 TFLOP/s`
 
 The naive and SOTA performance will act as floor and ceiling, respectively, for what a grammar can achieve. By evaluating the grammar at intervals throughout the training cycle, I can track the gains in performance over time. Comparing different training trajectories as they (hopefully) trace from the naive to the SOTA will allow me to measure the effect that grammar design decisions have on how quickly a performant kernel can be found.
+
+I expect (hope) the performance trajectories to reveal distinct patterns that look something like the placeholder plot below:
+
+<img width="841" height="547" alt="template-performance-eval" src="https://github.com/user-attachments/assets/79af3788-6a6f-4ac4-a9f9-7039f83818d5" />
+
+For reasons discussed above, I unfortunately do not expect any grammar to approach FlashAttention2. While I am currently searching for a new benchmark (perhaps adopting one from Level 2 of [KernelBench](https://github.com/ScalingIntelligence/KernelBench) to compare AI-derived kernel with AI-derived kernel), it remains to be seen if FlashAttention2 is really inappropriate or not.
+
+While I may not approach the ceiling itself, the rate at which the grammar finds valuable optimizations is interesting, and so is the rate at which it is able to recover from a "bad move". By making plots like above, I will be able to perform ablation studies by modifying the grammar (for example by setting non-trivial defaults for parameters like tile size after adding a **SequentialLoop**).
