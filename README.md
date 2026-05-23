@@ -18,6 +18,118 @@ To answer my research questions, I will proceed in three phases:
 
 Once the systems for training a grammar and evaluating an output are in place, I can experiment with different grammars and design philosophies. I can perform ablation studies to understand the effect that design decisions have on how quickly a given grammar can converge to state-of-the-art performance (if at all).
 
+## Grammar Design
+
+### How to Design a cuTile Kernel
+
+The first question I need to answer is: How can I represent an attention kernel as a grammar? What primitive and rewrite rules can I define that allow me to programatically define correct attention kernels of varying performance?
+
+I decided to take a principled approach to this question by first understanding what the programming model is for writing kernels in `cuTile`. As a review, [cuTile](https://docs.nvidia.com/cuda/cutile-python/) is a DSL made by NVIDIA to provide kernel engineers with a "tile code" abstraction. Instead of designing a kernel by manually assigning work to and synchronizing threads in a warp block, the body of a `cuTile` kernel is composed of basic operations over **tiles**. A tile is an immutable tensor that only exists in kernel code, and instead of mutating the memory itself, the programmer specifies when to load the tile from global memory, when to store it back, and what operations to perform on it. The compiler then optimizes the low-level control of threads, synchrony, and async memory access patterns.
+
+Under the Tile abstraction, designing a kernel becomes an exercise in assigning what work gets done to what Tile and when. To understand the types of decisions being made, I wrote a simple two-stage pipeline in `dev/playground.py`. This demonstrates two basic operations which together inform a surprisingly deep undersanding of how to make design decisions in a `cuTile` kernel.
+
+### Loops over Tiles
+
+When a kernel launches, it follows CUDA by assigning work to a 3D grid of blocks, which execute in parallel. Following the tile-first programming model, instead of thinking about threads in warps in grids, a `cuTile` kernel is best conceptualized as a deeply nested for-loop in which every iteration at every level is executed at the same time. The loops iterate over tiles in each dimension of the output, and the body of the kernel computes a single output tile. Thus, a `cuTile` kernel is a massive parallel for-loop over tiles.
+
+> [!NOTE]
+> `cuTile` is an expressive DSL. I'm sure there are other ways to think about how work is assigned to the body of a kernel block. Here I share one perspective which I happen to find convincing.
+
+By exploring the two stages of the pipeline, we can better understand how loops over tiles pervade the `cuTile` kernel design process.
+
+The first operation (stage 2 in the pipeline, my apologies) is a simple element-wise addition of two matrices. The kernel launches a grid of blocks, each of which is assigned a tile of the output to compute. The data dependency of the compute operation over the tile reveals what input tiles must be loaded to shared memory. Because the operation is element-wise, a single tile of the output depends on a single, corresponding tile in each input -- these are fetched from global memory before the compute operation. At the end of the kernel, the output tile is stored to global memory. The block grid each computes a disjoint tile, and the output is produced.
+
+To summarize, we trivially identified a correct kernel by first mapping output to input tiles through the compute operation, then issuing loads and stores as required before and after the computation. In pseudocode:
+
+```
+Load(input_a_, bid.x, bid.y, TILE_X, TILE_Y)            // load required tiles from input
+Load(input_b_, bid.x, bid.y, TILE_X, TILE_Y)
+
+output_ = Compute(input_a, input_b_)
+
+Store(output, bid.x, bid.y, TILE_X, TILE_Y, output_)    // store the result cooperatively
+```
+
+This is a basic, generalizable pattern.
+
+The second operation (stage 1 in the pipeline, my apologies) illustrates what happens when the data dependency is non-trivial. In this case, we are performing a matrix multiplication, so a single tile in the output depends on entire rows and columns in the first and second input, respectively. For the trivial example, we load a large tile from each input that spans the entire range of dependent indices. However, for large inputs, this will quickly fill the shared memory on device (an L4 GPU has 48 KB of shared memory by default).
+
+This brings us to our first idea on how to design a better kernel: split the `K` dimension into `K / TILE_K` tiles of size `TILE_K`, and compute partial matrix multiplications of the inputs of the more-manageable size of `(TILE_X, TILE_K)` and `(TILE_K, TILE_Y)`. By delegating fine-tune control of threads and warp blocks to the compiler, the programmer is free to make decisions in terms of which dimension to break into tiles, and how big those tiles should be.
+
+Applying this change, we are adding a sequential loop in the body of the grid-parallel kernel:
+
+```
+for tk in K / TILE_K:
+
+    Load(input_a_, bid.x + tk, bid.y,      TILE_N, TILE_K)    // load the k'th tile along the row
+    Load(input_b_, bid.x,      bid.y + tk, TILE_K, TILE_M)    // load the k'th tile along the column
+
+    output_ = Compute(input_a, input_b_)
+
+    Store(output, bid.x, bid.y, TILE_N, TILE_M, output_)
+```
+
+This is all well and good, but there's something missing. Because the compute operation is reducing along a dimension in the inputs that is not present in the output, the same region in the output is being written in each iteration. This is incorrect -- instead of overwriting the partial result, the reduction should be accumulated in a `(TILE_N, TILE_M)`-shaped tensor. Then, after the full output tile is computed, the result can be written back to global memory. Thus, the full kernel looks like:
+
+```
+acc_ = cp.zeros((TILE_N, TILE_M))
+
+for tk in K / TILE_K:
+
+    Load(input_a_, bid.x + tk, bid.y,      TILE_N, TILE_K)    // load the k'th tile along the row
+    Load(input_b_, bid.x,      bid.y + tk, TILE_K, TILE_M)    // load the k'th tile along the column
+
+    _ = Compute(input_a, input_b_, acc_)                      // compute with ct.mma to accumulate into acc_
+
+Store(output, bid.x, bid.y, TILE_N, TILE_M, acc_)             // store complete tile from acc_
+```
+
+This illustrates a key insight: just as the `@ct.kernel` is analogous to a parallel for-loop, computation in the body of a kernel can be further sub-divided into tiles and iterated over sequentially (in reality, the JIT compiler will apply heavy optimizations to these "sequential" for-loops, but the mental model is the same). When this sub-tiling is applied, if the iterations all write to the same region in the output (which happens when the sub-tiling dimension does not appear in the output), then the computation is a reduction and we need to accumulate partial results. Otherwise, we're free to sub-tile at any time to reduce shared memory pressure.
+
+### What About Loads and Stores?
+
+I did something slightly deceitful in the previous example. When transitioning to using an accumulator, I raised the terminal `Store` outside the bounds of the loop and into a higher scope. Why was that allowed? It was, but don't take my word for it.
+
+A load or a store can be hoisted up out of a loop or sunk into a loop. By changing the level at which the memory operation is initiated, the characteristics of memory traffic between global and shared memory change. Making decisions about when to materialize a tile is an extremely important way to optimize performance: sometimes it's better to load in one big buffer, then computer small sections of it in the body of the sequential loop. Other times, it's better to load many smaller tiles. These tradeoffs are captured in the basic decision: At what scope should I initiate the load or store?
+
+The level of the load/store determines its memory footprint in shared memory. The memory footprint is a function of data dependency: in a sequential loop like the matrix multiplication example above, hoisting the load would require loading in the entire row once again, since the load offset in the loop depends on the iteration of the loop. The store, on the other hand, could be hoisted without changing its footprint because the offset in the destination did not depend on the iteration index.
+
+The memory footprint and data dependency, respectively, enforce upper and lower bounds on where a memory operation can be placed. The higher the scope, the larger the potential memory footprint of a load. Shared memory is finite, and so a load could fail if it attempts to loard more data than is available. The lower the loop placement, the narrower the scope that the memory operation is available in. If a Load is sunk lower than a compute node that depends on it, the compute node has no initialized memory to read from.
+
+### The Resulting Grammar
+
+| **Node** | **Description** | **Parameters** | **Constraints** |
+| --- | --- | --- | --- |
+| **Program** | The root of the AST. | None | Must have no ancestor. |
+| **ParallelLoop** | A single `ct.kernel` that launches a grid of parallel blocks. | tile_sizes (the size of tile in each dimension of the _output_) | tile_sizes must all be powers of two and divide into the corresponding dimension. When there are more than three tile dimensions, the earlier ones are compressed along the first grid dimension until a 3D grid can be defined. The grid must be wellformed (dims < 65,535). A **ParallelLoop** must be a direct child of **Program** and must have at least one child. |
+| **SequentialLoop** | A sub-tiling that iterates sequentially over one dimension inside a **ParallelLoop**. | dim (the dimension to tile over), tile_size (the size of the tile) | tile_size must be a power of two and divide evenly into the sub-tiled dimension. **SequentialLoop** can only appear as an ancestor of a **ParallelLoop**. |
+| **Load** | Transfer a tile from global memory to shared memory. | tensor, offset, tile_shape | There must be room in shared memory for the new tensor. Loads are leaf nodes. The **Load** must exist at or above the scope of the highest node that reads from it. |
+| **Store** | Transfer a tile from shared memory to global memory. | dst_tensor, offset, tile_shape, src_tensor | Stores are leaf nodes. Cannot be evaluated before a **Load** for each input has been evaluated in the current scope. |
+| **Compute** | Perform an operation on the given inputs, and optionally aggregate in a given accumulator. | op (the operation to perform), accumulate (Bool, whether or not to accumulate) | Computes are leaf nodes. |
+
+The nodes of the grammar are composed to form a tree. A the top is the **Program**. This includes host-side initialization and orchestration boilderplate. The children of the **Program** are **ParallelLoop**s, sorted and evaluated in typographical order by the data dependency graph. Each **ParallelLoop** is a separate kernel launch, and the tile dimensions and sizes are parameters that the optimization stage will modify.
+
+**ParallelLoop**s cannot be childless. Inside the body of the kernel are sub-tiling **SequentialLoop**s, **Load**s, **Store**s, and **Compute** nodes.
+
+We define an _atomic grammar_ as the naive stating point. Every compute stage is reduced to a single, simple operation. Each of these is wrapped in a **ParallelLoop**, triggering a separate kernel launch. If necessary, a **SequentialLoop** with an accumulator is applied if the naive **Load** requires more memory than is available in shared memory.
+
+Now that we have an atomic grammar, we need to talk about how to rewrite them.
+
+> [!Note]
+>Through investigating the ins and outs of how this grammar will behave, it became apparent that data dependency is important to track. For example, the memory footprint of a `Load` needs to be derived from what indices in the inputs a given output tile depends on. To derive this dependency, we can pull a page from [Halide's](https://people.csail.mit.edu/jrk/halide-pldi13.pdf) handbook and define a simple declarative language that specifies a) the stages of a pipeline (which are each represented as a **ParallelLoop** in the naive atomic grammar); and b) the exact data dependency between tiles of the outputs and inputs. After declaring the stages and dependencies, the atomic grammar can be trivially generated, seeding the auto-tuning search.
+
+### Rewrite Rules
+
+| **Rule** | **Effect** | **Input(s)** | **Constraint(s)** |
+| --- | --- | --- | --- |
+| **Hoist** | | | |
+| **Sink** | | | |
+| **Subtile** | | | |
+| **Unwrap** | | | |
+| **InterchangeLoop** | | | |
+| **Merge** | | | |
+| **EliminateRoundTrip** | | |
+
 ## Evaluation
 
 To evaluate the product of a grammar, I wrote a benchmark script in `benchmark.py`. The benchmark records how long it takes to compute the forward pass of attention over a set of random inputs. The dimensions can be set to arbitrary values, but in the evaluation we will use the same settings as described in [Section 4.1 of FlashAttention2](https://arxiv.org/pdf/2307.08691). I will start by evauating the naive base case that constitutes the atomic initial state of the grammar (no fusion, no nesting loops, no tiling, reading/writing from global memory), as well as measuring the state of the art for the GPU I have access to (in this case, [FlashAttention2](https://arxiv.org/pdf/2307.08691), which was developed for the A100 GPU).
