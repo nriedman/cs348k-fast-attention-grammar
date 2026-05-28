@@ -89,6 +89,23 @@ SHAPE_RULES = {
 }
 
 
+# --------------------------------------------------------------------------
+# Emission rules: map a Compute op to the cuTile expression that computes it,
+# given the already-emitted variable names of its inputs. The op name in the
+# AST is logical; the cuTile (1.3.0) spelling can differ -- e.g. relu maps to
+# ct.maximum(0, x). Adding an op = one entry here + one in SHAPE_RULES above.
+# Unknown ops are rejected rather than emitted blindly.
+# --------------------------------------------------------------------------
+EMIT_RULES = {
+    # confirmed against cuTile 1.3.0
+    "matmul": lambda a: f"ct.matmul({a[0]}, {a[1]})",
+    "add":    lambda a: f"ct.add({a[0]}, {a[1]})",
+    "relu":   lambda a: f"ct.maximum(0, {a[0]})",
+    "mul":    lambda a: f"{a[0]} * {a[1]}",
+    "exp":    lambda a: f"ct.exp({a[0]})",
+}
+
+
 def _resolve_index(index: list[str], tile_shape: Shape, global_shape: Shape,
                    scope: set[str], what: str) -> list[str]:
     """Turn per-dim index NAMES into emitted tile coordinates.
@@ -230,10 +247,15 @@ class CuTileRenderer:
         self._emit(f"{nm} = ct.load({n.source}, ({', '.join(idx)}), {shp})")
 
     def _visit_Compute(self, n: Compute) -> None:
+        if n.op not in EMIT_RULES:
+            raise ValueError(
+                f"no cuTile emission rule for compute op {n.op!r}; "
+                f"supported: {sorted(EMIT_RULES)}")
         nm = self._fresh()
-        args = ", ".join(self._name(i) for i in n.inputs)
+        arg_names = [self._name(i) for i in n.inputs]
+        rhs = EMIT_RULES[n.op](arg_names)
         self.names[id(n)] = nm
-        self._emit(f"{nm} = ct.{n.op}({args})  # tile {self.shapes[id(n)]}")
+        self._emit(f"{nm} = {rhs}  # tile {self.shapes[id(n)]}")
 
     def _visit_Store(self, n: Store) -> None:
         shp = self.shapes[id(n.src)]
