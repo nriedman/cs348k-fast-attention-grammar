@@ -119,7 +119,7 @@ SHAPE_RULES = {
 # Unknown ops are rejected rather than emitted blindly.
 # --------------------------------------------------------------------------
 EMIT_RULES = {
-    # confirmed against cuTile 1.3.0
+    # all confirmed against cuTile 1.3.0
     "matmul": lambda a: f"ct.matmul({a[0]}, {a[1]})",
     "add":    lambda a: f"ct.add({a[0]}, {a[1]})",
     "relu":   lambda a: f"ct.maximum(0, {a[0]})",
@@ -139,7 +139,7 @@ EMIT_RULES = {
 # --------------------------------------------------------------------------
 REDUCE_RULES = {
     "matmul": (
-        lambda shp, dtype: f"ct.full({shp}, 0, dtype={dtype})",
+        lambda shp, dtype: f"ct.zeros({shp}, dtype={dtype})",
         lambda a, acc:     f"ct.mma({a[0]}, {a[1]}, {acc})",
     ),
     # later, e.g.:
@@ -213,9 +213,9 @@ class CuTileRenderer:
     def _emit(self, s: str) -> None:
         self.lines.append("    " * self.indent + s)
 
-    def _fresh(self) -> str:
+    def _fresh(self, prefix: str = "t") -> str:
         self._n += 1
-        return f"t{self._n}"
+        return f"{prefix}{self._n}"
 
     def _name(self, v: Value) -> str:
         return self.names[id(v)]
@@ -327,7 +327,7 @@ class CuTileRenderer:
                 f"op {n.partial.op!r} cannot be a reduction partial; "
                 f"reducible: {sorted(REDUCE_RULES)}")
         init_fn, acc_fn = REDUCE_RULES[n.partial.op]
-        acc = "acc"
+        acc = self._fresh("acc")                      # unique name, avoids collisions
         self.names[id(n)] = acc                       # the loop's result
         self._emit(f"{acc} = {init_fn(self.shapes[id(n)], f'{self._cur_out}.dtype')}")
         trips = -(-self._reduction_extent(n) // n.tile)   # cdiv(K, TS_k), literal
@@ -383,19 +383,37 @@ def structural_key(node: Node, _memo: dict[int, tuple] | None = None) -> tuple:
 
 
 class RenderCache:
-    """Maps a structural key -> rendered kernel. Later this can just as easily
-    cache a benchmark measurement instead of (or alongside) the source."""
+    """Structural-key cache that fronts module generation. Two facets, both
+    keyed by structural_key so equivalent ASTs collapse:
+
+      module(program)  -> (source, hit)   memoizes emit_module; a hit means an
+                                           identical program was already emitted,
+                                           so the caller can skip recompilation.
+      result/record    -> measurement     the caller stashes the eval result
+                                           (e.g. mean_gpu_ms) per key, so a repeat
+                                           configuration skips compile+benchmark.
+
+    Source dedup alone saves re-emission; pairing it with the result store is
+    what actually skips the expensive compile + GPU benchmark in the search."""
 
     def __init__(self) -> None:
-        self._cache: dict[tuple, str] = {}
+        self._src: dict[tuple, str] = {}      # structural key -> module source
+        self._result: dict[tuple, object] = {}  # structural key -> eval result
 
-    def render(self, program: Program) -> tuple[str, bool]:
+    def module(self, program: Program, fn_name: str = "fn") -> tuple[str, bool]:
         key = structural_key(program)
-        if key in self._cache:
-            return self._cache[key], True          # cache hit
-        src = CuTileRenderer().render(program)      # fresh renderer per call
-        self._cache[key] = src
+        if key in self._src:
+            return self._src[key], True            # cache hit -> skip emit + recompile
+        src = emit_module(program, fn_name)
+        self._src[key] = src
         return src, False
+
+    def result(self, program: Program):
+        """Prior evaluation result for this program, or None if never run."""
+        return self._result.get(structural_key(program))
+
+    def record(self, program: Program, measurement) -> None:
+        self._result[structural_key(program)] = measurement
 
 
 # --------------------------------------------------------------------------
@@ -474,10 +492,10 @@ def _emit_kernel(loop: ParallelLoop, tensors: dict[str, Shape],
     names: dict[int, str] = {}
     counter = 0
 
-    def fresh() -> str:
+    def fresh(prefix: str = "t") -> str:
         nonlocal counter
         counter += 1
-        return f"t{counter}"
+        return f"{prefix}{counter}"
 
     def sym_shape(index, tile_shape, global_shape) -> list[str]:
         out = []
@@ -517,7 +535,7 @@ def _emit_kernel(loop: ParallelLoop, tensors: dict[str, Shape],
                     v = fresh(); names[id(stmt)] = v
                     out.append(f"{ind}{v} = {EMIT_RULES[stmt.op](args)}")
             elif isinstance(stmt, ReductionLoop):
-                acc = "acc"
+                acc = fresh("acc")                # unique name, avoids collisions
                 # accumulator shape == output tile (also registers TS_<out dims>)
                 acc_shape = []
                 for d, vv in enumerate(loop.index_vars):
@@ -693,16 +711,6 @@ if __name__ == "__main__":
         )],
     )
 
-    cache = RenderCache()
-
-    src, hit = cache.render(matmul)
-    print(f"# matmul  (cache hit: {hit})")
-    print(src)
-
-    src, hit = cache.render(ew)
-    print(f"# elementwise  (cache hit: {hit})")
-    print(src)
-
     # ---- Y = relu(X), 4-D output -> needs grid collapse/decode ----
     x = Load("X", ["b0", "b1", "bm", "bn"])
     ry = Compute("relu", [x])
@@ -714,19 +722,27 @@ if __name__ == "__main__":
             body=[x, ry, Store("Y", ry, ["b0", "b1", "bm", "bn"])],
         )],
     )
-    src, hit = cache.render(batched)
-    print(f"# 4-D batched  (cache hit: {hit})")
-    print(src)
 
-    # An independently built but structurally identical matmul -> cache hit,
-    # renderer is never invoked.
+    # Inline snippet display (uncached -- cheap, just for reading the kernel).
+    for label, prog in [("matmul", matmul), ("elementwise", ew), ("4-D batched", batched)]:
+        print(f"# {label}")
+        print(CuTileRenderer().render(prog))
+
+    # RenderCache fronts emit_module: a structurally identical AST skips both
+    # re-emission and -- via the recorded result -- recompilation + benchmarking.
+    cache = RenderCache()
+    _, hit = cache.module(matmul)
+    print(f"# emit matmul module        (cache hit: {hit})")    # False -- first time
+    cache.record(matmul, 1.23)                                  # pretend we benchmarked it (ms)
+
     a2 = Load("A", ["bm", "k"]); b2 = Load("B", ["k", "bn"]); c2 = Compute("matmul", [a2, b2])
-    matmul_dup = Program(
+    matmul_dup = Program(                                        # independently rebuilt, identical
         tensors={"A": (M, K), "B": (K, N), "C": (M, N)},
         body=[ParallelLoop(
             out="C", tile_shape=(Mt, Nt), index_vars=("bm", "bn"),
             body=[a2, b2, c2, Store("C", c2, ["bm", "bn"])],
         )],
     )
-    _, hit = cache.render(matmul_dup)
-    print(f"# rebuilt-identical matmul  (cache hit: {hit})")
+    _, hit = cache.module(matmul_dup)
+    print(f"# rebuilt-identical matmul  (cache hit: {hit})")     # True -- emit skipped
+    print(f"# reused measurement        : {cache.result(matmul_dup)} ms")  # 1.23 -- compile+bench skipped
