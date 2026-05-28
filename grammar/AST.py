@@ -10,6 +10,7 @@ Scope of this first cut:
 
 from __future__ import annotations
 from dataclasses import dataclass, field
+import math
 
 Shape = tuple[int, ...]
 
@@ -101,7 +102,8 @@ EMIT_RULES = {
     "matmul": lambda a: f"ct.matmul({a[0]}, {a[1]})",
     "add":    lambda a: f"ct.add({a[0]}, {a[1]})",
     "relu":   lambda a: f"ct.maximum(0, {a[0]})",
-    "mul":    lambda a: f"{a[0]} * {a[1]}",
+    # plausible spellings, NOT yet exercised -- confirm against the 1.3.0 ref
+    "mul":    lambda a: f"ct.mul({a[0]}, {a[1]})",
     "exp":    lambda a: f"ct.exp({a[0]})",
 }
 
@@ -189,7 +191,7 @@ class CuTileRenderer:
             if isinstance(stmt, Store):
                 self._infer(stmt.src, tuple(loop.tile_shape), tensors)
         # 2. emit the kernel.
-        args = ", ".join(sorted(tensors))
+        args = ", ".join(_loop_tensors(loop))
         grid = tuple(
             tensors[loop.out][d] // loop.tile_shape[d]
             for d in range(len(loop.tile_shape))
@@ -314,6 +316,196 @@ class RenderCache:
         src = CuTileRenderer().render(program)      # fresh renderer per call
         self._cache[key] = src
         return src, False
+
+
+# --------------------------------------------------------------------------
+# Module emission: turn a Program into a full, runnable cuTile module --
+# imports, @ct.kernel defs with ConstInt tile/extent params, and a host-side
+# callable `fn(*inputs) -> output` that allocates intermediates and launches
+# each stage. Mirrors the cuTile 1.3.0 runtime idiom (cuda.tile + cupy).
+# --------------------------------------------------------------------------
+def _tup(parts: list[str]) -> str:
+    inner = ", ".join(parts)
+    if len(parts) == 1:
+        inner += ","          # 1-tuple needs a trailing comma
+    return f"({inner})"
+
+
+def _infer_program(program: Program) -> dict[int, Shape]:
+    """Run backward shape inference over every kernel; return id->tile shape."""
+    r = CuTileRenderer()
+    r._tensors = program.tensors
+    for loop in program.body:
+        r._scope = set(loop.index_vars)
+        for stmt in loop.body:
+            if isinstance(stmt, Store):
+                r._infer(stmt.src, tuple(loop.tile_shape), program.tensors)
+    return r.shapes
+
+
+def _program_io(program: Program) -> tuple[list[str], list[str], list[str]]:
+    """Classify tensors as inputs (read, never written), intermediates
+    (written then read by a later stage), and outputs (written, never read)."""
+    written, read = set(), set()
+    for loop in program.body:
+        written.add(loop.out)
+        for stmt in loop.body:
+            if isinstance(stmt, Load):
+                read.add(stmt.source)
+    return (sorted(read - written),         # inputs
+            sorted(written & read),          # intermediates
+            sorted(written - read))          # outputs
+
+
+def _loop_tensors(loop: ParallelLoop) -> list[str]:
+    """Tensors this kernel touches, ordered: load sources (first-seen), dest."""
+    seen: list[str] = []
+    for stmt in loop.body:
+        if isinstance(stmt, Load) and stmt.source not in seen:
+            seen.append(stmt.source)
+    seen.append(loop.out)
+    return seen
+
+
+def _emit_kernel(loop: ParallelLoop, tensors: dict[str, Shape],
+                 shapes: dict[int, Shape]):
+    """Return (name, tensor_args, const_params, body_lines) for one kernel.
+
+    Tile dims resolve to ConstInt params: a subdivided dim -> TS_<axis> (a tile
+    size), a whole dim -> <AXIS> (an extent like K). The same machinery that
+    picks the coordinate (_resolve_index) decides which is which from the shape.
+    """
+    name = f"{loop.out}_kernel"
+    targs = _loop_tensors(loop)
+    scope = set(loop.index_vars)
+    tiles: dict[str, int] = {}      # TS_<axis> -> tile size
+    extents: dict[str, int] = {}    # <AXIS>    -> full extent
+
+    def sym_shape(index, tile_shape, global_shape) -> list[str]:
+        out = []
+        for nm, t, g in zip(index, tile_shape, global_shape):
+            if t < g:
+                s = f"TS_{nm}"; tiles[s] = t; out.append(s)
+            else:
+                s = nm.upper(); extents[s] = g; out.append(s)
+        return out
+
+    body: list[str] = []
+    # prologue: bind block indices (reuse the grid-decode logic)
+    grid = tuple(-(-tensors[loop.out][d] // loop.tile_shape[d])
+                 for d in range(len(loop.tile_shape)))
+    tmp = CuTileRenderer(); tmp.indent = 1
+    tmp._emit_grid_decode(loop.index_vars, grid)
+    body.extend(tmp.lines)
+
+    names: dict[int, str] = {}
+    counter = 0
+    for stmt in loop.body:
+        if isinstance(stmt, Load):
+            counter += 1; v = f"t{counter}"; names[id(stmt)] = v
+            ts, g = shapes[id(stmt)], tensors[stmt.source]
+            idx = _resolve_index(stmt.index, ts, g, scope, f"load {stmt.source}")
+            shp = sym_shape(stmt.index, ts, g)
+            body.append(f"    {v} = ct.load({stmt.source}, {_tup(idx)}, {_tup(shp)})")
+        elif isinstance(stmt, Compute):
+            counter += 1; v = f"t{counter}"
+            rhs = EMIT_RULES[stmt.op]([names[id(i)] for i in stmt.inputs])
+            names[id(stmt)] = v
+            body.append(f"    {v} = {rhs}")
+        elif isinstance(stmt, Store):
+            ts, g = shapes[id(stmt.src)], tensors[stmt.dest]
+            idx = _resolve_index(stmt.index, ts, g, scope, f"store {stmt.dest}")
+            body.append(f"    ct.store({stmt.dest}, {_tup(idx)}, {names[id(stmt.src)]})")
+
+    # params: extents (sorted) then tile sizes (in output-dim order)
+    tile_order = [f"TS_{v}" for v in loop.index_vars if f"TS_{v}" in tiles]
+    const_params = ([(k, extents[k]) for k in sorted(extents)] +
+                    [(k, tiles[k]) for k in tile_order])
+    return name, targs, const_params, body
+
+
+def program_flops(program: Program, shapes: dict[int, Shape] | None = None):
+    """Total FLOPs from the AST. Exact for matmul/elementwise; if any op has
+    no rule, returns exact=False so callers can suppress TFLOP/s."""
+    if shapes is None:
+        shapes = _infer_program(program)
+    total, exact = 0, True
+    for loop in program.body:
+        gout = math.prod(program.tensors[loop.out])
+        for stmt in loop.body:
+            if not isinstance(stmt, Compute):
+                continue
+            if stmt.op == "matmul":
+                total += 2 * gout * shapes[id(stmt.inputs[0])][-1]   # 2*M*N*K
+            elif stmt.op in ("add", "mul", "relu", "exp"):
+                total += gout
+            else:
+                exact = False
+    return total, exact
+
+
+def emit_module(program: Program, fn_name: str = "fn") -> str:
+    shapes = _infer_program(program)
+    inputs, intermediates, outputs = _program_io(program)
+    if not outputs:
+        raise ValueError("program has no output tensor (written but never read)")
+
+    L = ["import cuda.tile as ct", "import cupy as cp", "import numpy as np", "",
+         "ConstInt = ct.Constant[int]", "",
+         "# --- tunable tile sizes (vary these to autotune; one tuple per stage) ---"]
+    for loop in program.body:
+        L.append(f"TILE_{loop.out} = {tuple(loop.tile_shape)}")
+    L.append("")
+
+    launches = []
+    for loop in program.body:
+        name, targs, const_params, body = _emit_kernel(loop, program.tensors, shapes)
+        sig = ", ".join(targs + [f"{p}: ConstInt" for p, _ in const_params])
+        L += ["@ct.kernel", f"def {name}({sig}):"] + body + [""]
+
+        rank = len(loop.tile_shape)
+        cdivs = [f"ct.cdiv({loop.out}.shape[{d}], TILE_{loop.out}[{d}])"
+                 for d in range(rank)]
+        if rank <= 3:
+            grid_parts = cdivs + ["1"] * (3 - rank)
+        else:                                  # collapse leading dims onto grid.x
+            grid_parts = [" * ".join(cdivs[:-2]), cdivs[-2], cdivs[-1]]
+        vals = []
+        for p, v in const_params:
+            if p.startswith("TS_"):
+                d = list(loop.index_vars).index(p[3:])
+                vals.append(f"TILE_{loop.out}[{d}]")
+            else:
+                vals.append(str(v))
+        launches.append((f"({', '.join(grid_parts)})", name, _tup(targs + vals)))
+
+    # host callable
+    L.append(f"def {fn_name}({', '.join(inputs)}):")
+    L.append(f"    dtype = {inputs[0]}.dtype")
+    L.append("    stream = cp.cuda.get_current_stream()")
+    for t in intermediates + outputs:
+        L.append(f"    {t} = cp.zeros({tuple(program.tensors[t])}, dtype=dtype)")
+    for grid_expr, kname, args in launches:
+        L.append(f"    grid = {grid_expr}")
+        L.append(f"    ct.launch(stream, grid, {kname}, {args})")
+    L.append(f"    return {outputs[0]}" if len(outputs) == 1
+             else f"    return ({', '.join(outputs)})")
+    L.append("")
+
+    flops, exact = program_flops(program, shapes)
+    meta = {
+        "inputs": [[t, list(program.tensors[t])] for t in inputs],
+        "output": [outputs[0], list(program.tensors[outputs[0]])],
+        "flops": flops,
+        "flops_exact": exact,
+    }
+    L += [f"KERNEL_META = {meta!r}", "",
+          'if __name__ == "__main__":',
+          '    args = [cp.random.randn(*s, dtype=cp.float32) for _, s in KERNEL_META["inputs"]]',
+          f"    out = {fn_name}(*args)",
+          "    cp.cuda.runtime.deviceSynchronize()",
+          '    print("ran:", KERNEL_META["inputs"], "->", list(out.shape))']
+    return "\n".join(L) + "\n"
 
 
 # --------------------------------------------------------------------------

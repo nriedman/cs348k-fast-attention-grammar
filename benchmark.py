@@ -1,24 +1,23 @@
 """
-benchmark.py — Attention Kernel Benchmark
-==========================================
-Measures the runtime of a single attention kernel on a standardised task.
+bench.py — Generic cuTile kernel benchmark
+===========================================
+Times a generated kernel module's host callable. Unlike the attention-specific
+harness, input shapes and the FLOP count come from the module's KERNEL_META, so
+it works for any Program our emitter produces.
 
 Usage
 -----
-    python benchmark.py \
-        --kernel path/to/kernel.py \
-        --kernel-fn attention \
-        [--batch 8] [--heads 16] [--seq 2048] [--dim 64] \
-        [--warmup 50] [--iters 200] \
-        [--dtype fp16|bf16|fp32] \
-        [--label my_kernel] \
-        [--output results/my_kernel.json]
+    python bench.py --kernel generated_kernel.py [--kernel-fn fn] \
+        [--warmup 50] [--iters 200] [--dtype fp16|fp32] \
+        [--label my_kernel] [--output results/my_kernel.json]
 
-Kernel interface
-----------------
-The file passed to --kernel must expose a callable with the signature:
-    fn(q, k, v) -> out
-where q, k, v, and out are all (B, S, H, D) float CUDA tensors.
+Kernel module interface
+-----------------------
+The module must expose:
+  - a callable `fn(*inputs) -> output`  (cupy arrays)
+  - KERNEL_META = {"inputs": [[name, [dims...]], ...],
+                   "output": [name, [dims...]],
+                   "flops": int, "flops_exact": bool}
 """
 
 import argparse
@@ -30,45 +29,46 @@ import time
 from pathlib import Path
 from typing import Callable
 
-import torch
+import cupy as cp
 
-DTYPE_MAP = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
+DTYPE_MAP = {"fp16": cp.float16, "fp32": cp.float32}
 
 
-def load_kernel(path: str, fn_name: str) -> Callable:
+def load_module(path: str):
     p = Path(path).resolve()
     if not p.exists():
         raise FileNotFoundError(f"Kernel file not found: {p}")
     spec = importlib.util.spec_from_file_location("_kernel", p)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)  # type: ignore[union-attr]
-    if not hasattr(mod, fn_name):
-        raise AttributeError(f"'{p}' has no attribute '{fn_name}'")
-    return getattr(mod, fn_name)
+    return mod
 
 
-def benchmark(fn: Callable, q, k, v, warmup: int, iters: int) -> dict:
-    # Warmup
+def make_inputs(meta: dict, dtype) -> list:
+    return [cp.random.randn(*dims, dtype=dtype) for _name, dims in meta["inputs"]]
+
+
+def benchmark(fn: Callable, inputs: list, warmup: int, iters: int) -> dict:
     for _ in range(warmup):
-        fn(q, k, v)
-    torch.cuda.synchronize()
+        fn(*inputs)
+    cp.cuda.runtime.deviceSynchronize()
 
-    # GPU-event timing
-    start_ev = torch.cuda.Event(enable_timing=True)
-    end_ev = torch.cuda.Event(enable_timing=True)
+    # GPU-event timing over the whole loop
+    start_ev = cp.cuda.Event()
+    end_ev = cp.cuda.Event()
     start_ev.record()
     for _ in range(iters):
-        fn(q, k, v)
+        fn(*inputs)
     end_ev.record()
-    torch.cuda.synchronize()
-    mean_gpu_ms = start_ev.elapsed_time(end_ev) / iters
+    end_ev.synchronize()
+    mean_gpu_ms = cp.cuda.get_elapsed_time(start_ev, end_ev) / iters
 
     # Per-iter wall-clock distribution
     latencies = []
     for _ in range(iters):
         t0 = time.perf_counter()
-        fn(q, k, v)
-        torch.cuda.synchronize()
+        fn(*inputs)
+        cp.cuda.runtime.deviceSynchronize()
         latencies.append((time.perf_counter() - t0) * 1e3)
 
     return {
@@ -83,17 +83,13 @@ def benchmark(fn: Callable, q, k, v, warmup: int, iters: int) -> dict:
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Attention kernel benchmark")
-    p.add_argument("--kernel",    required=True, help="Path to kernel Python file")
-    p.add_argument("--kernel-fn", default="attention", help="Function name in kernel file")
-    p.add_argument("--label",     default=None, help="Human-readable name for this run")
-    p.add_argument("--batch",     type=int, default=8)
-    p.add_argument("--heads",     type=int, default=16)
-    p.add_argument("--seq",       type=int, default=2048)
-    p.add_argument("--dim",       type=int, default=64)
+    p = argparse.ArgumentParser(description="Generic cuTile kernel benchmark")
+    p.add_argument("--kernel",    required=True, help="Path to generated kernel module")
+    p.add_argument("--kernel-fn", default="fn", help="Host callable name")
+    p.add_argument("--label",     default=None)
     p.add_argument("--warmup",    type=int, default=50)
     p.add_argument("--iters",     type=int, default=200)
-    p.add_argument("--dtype",     choices=["fp16", "bf16", "fp32"], default="fp16")
+    p.add_argument("--dtype",     choices=list(DTYPE_MAP), default="fp32")
     p.add_argument("--output",    default=None, help="Path to write JSON results")
     return p.parse_args()
 
@@ -102,53 +98,49 @@ def main():
     args = parse_args()
     dtype = DTYPE_MAP[args.dtype]
 
-    if not torch.cuda.is_available():
-        print("[ERROR] CUDA not available.", file=sys.stderr)
+    if cp.cuda.runtime.getDeviceCount() == 0:
+        print("[ERROR] No CUDA device available.", file=sys.stderr)
         sys.exit(1)
 
-    device   = torch.cuda.current_device()
-    dev_name = torch.cuda.get_device_name(device)
-    label    = args.label or Path(args.kernel).stem
-
-    print(f"[bench] Device : {dev_name}")
-    print(f"[bench] Kernel : {label}  ({args.kernel}::{args.kernel_fn})")
-    print(f"[bench] Config : B={args.batch} H={args.heads} S={args.seq} D={args.dim} dtype={args.dtype}")
+    dev_name = cp.cuda.runtime.getDeviceProperties(cp.cuda.runtime.getDevice())["name"].decode()
+    label = args.label or Path(args.kernel).stem
 
     try:
-        fn = load_kernel(args.kernel, args.kernel_fn)
+        mod = load_module(args.kernel)
+        fn = getattr(mod, args.kernel_fn)
+        meta = mod.KERNEL_META
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)
         sys.exit(1)
 
-    shape = (args.batch, args.seq, args.heads, args.dim)
-    q = torch.randn(shape, dtype=dtype, device="cuda")
-    k = torch.randn(shape, dtype=dtype, device="cuda")
-    v = torch.randn(shape, dtype=dtype, device="cuda")
+    print(f"[bench] Device : {dev_name}")
+    print(f"[bench] Kernel : {label}  ({args.kernel}::{args.kernel_fn})")
+    print(f"[bench] Inputs : {meta['inputs']}  dtype={args.dtype}")
 
-    stats = benchmark(fn, q, k, v, warmup=args.warmup, iters=args.iters)
+    inputs = make_inputs(meta, dtype)
+    stats = benchmark(fn, inputs, warmup=args.warmup, iters=args.iters)
 
-    # FLOP count: 4·B·H·S²·D  (QKᵀ + AV, both matmuls)
-    flops = 4.0 * args.batch * args.heads * args.seq ** 2 * args.dim
-    stats["tflops"] = flops / (stats["mean_gpu_ms"] * 1e-3) / 1e12
-
-    print(f"[bench] mean GPU : {stats['mean_gpu_ms']:.3f} ms  |  {stats['tflops']:.2f} TFLOP/s")
+    flops = meta.get("flops")
+    if flops and meta.get("flops_exact", False):
+        stats["tflops"] = flops / (stats["mean_gpu_ms"] * 1e-3) / 1e12
+        perf = f"  |  {stats['tflops']:.2f} TFLOP/s"
+    else:
+        # FLOPs unknown or only approximate for this workload -> report latency only
+        perf = "  |  TFLOP/s n/a"
+    print(f"[bench] mean GPU : {stats['mean_gpu_ms']:.3f} ms{perf}")
 
     result = {
         "label":  label,
         "device": dev_name,
-        "config": {
-            "batch": args.batch, "heads": args.heads,
-            "seq":   args.seq,   "dim":   args.dim, "dtype": args.dtype,
-        },
-        "stats": stats,
+        "config": {"dtype": args.dtype, "inputs": meta["inputs"], "output": meta["output"]},
+        "stats":  stats,
     }
-
     if args.output:
         out = Path(args.output)
         out.parent.mkdir(parents=True, exist_ok=True)
         with open(out, "w") as f:
             json.dump(result, f, indent=2)
-        print(f"[bench] Results → {out}")
+        print(f"[bench] Results -> {out}")
 
 
 if __name__ == "__main__":
