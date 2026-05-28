@@ -23,9 +23,7 @@ The module must expose:
 import argparse
 import importlib.util
 import json
-import statistics
 import sys
-import time
 from pathlib import Path
 from typing import Callable
 
@@ -49,37 +47,31 @@ def make_inputs(meta: dict, dtype) -> list:
 
 
 def benchmark(fn: Callable, inputs: list, warmup: int, iters: int) -> dict:
-    for _ in range(warmup):
-        fn(*inputs)
-    cp.cuda.runtime.deviceSynchronize()
-
-    # GPU-event timing over the whole loop
-    start_ev = cp.cuda.Event()
-    end_ev = cp.cuda.Event()
-    start_ev.record()
-    for _ in range(iters):
-        fn(*inputs)
-    end_ev.record()
-    end_ev.synchronize()
-    mean_gpu_ms = cp.cuda.get_elapsed_time(start_ev, end_ev) / iters
-
-    # Per-iter wall-clock distribution
-    latencies = []
-    for _ in range(iters):
-        t0 = time.perf_counter()
-        fn(*inputs)
+    try:
+        for _ in range(warmup):
+            fn(*inputs)
         cp.cuda.runtime.deviceSynchronize()
-        latencies.append((time.perf_counter() - t0) * 1e3)
 
-    return {
-        "mean_gpu_ms":    mean_gpu_ms,
-        "mean_wall_ms":   statistics.mean(latencies),
-        "median_wall_ms": statistics.median(latencies),
-        "stdev_wall_ms":  statistics.stdev(latencies) if len(latencies) > 1 else 0.0,
-        "min_wall_ms":    min(latencies),
-        "max_wall_ms":    max(latencies),
-        "iters":          iters,
-    }
+        # GPU-event timing over the whole loop, divided by iters
+        start_ev, end_ev = cp.cuda.Event(), cp.cuda.Event()
+        start_ev.record()
+        for _ in range(iters):
+            fn(*inputs)
+        end_ev.record()
+        end_ev.synchronize()
+
+        return {
+            "mean_gpu_ms": cp.cuda.get_elapsed_time(start_ev, end_ev) / iters,
+            "iters": iters,
+            "failed": False,
+        }
+    except Exception as e:
+        return {
+            "mean_gpu_ms": float("inf"),
+            "iters": iters,
+            "failed": True,
+            "error": str(e),
+        }
 
 
 def parse_args():
@@ -120,13 +112,18 @@ def main():
     inputs = make_inputs(meta, dtype)
     stats = benchmark(fn, inputs, warmup=args.warmup, iters=args.iters)
 
-    flops = meta.get("flops")
-    if flops and meta.get("flops_exact", False):
-        stats["tflops"] = flops / (stats["mean_gpu_ms"] * 1e-3) / 1e12
-        perf = f"  |  {stats['tflops']:.2f} TFLOP/s"
+    if stats["failed"]:
+        print(f"[bench] FAILED : {stats['error']}")
+        perf = "  |  FAILED"
+        stats["tflops"] = None
     else:
-        # FLOPs unknown or only approximate for this workload -> report latency only
-        perf = "  |  TFLOP/s n/a"
+        flops = meta.get("flops")
+        if flops and meta.get("flops_exact", False):
+            stats["tflops"] = flops / (stats["mean_gpu_ms"] * 1e-3) / 1e12
+            perf = f"  |  {stats['tflops']:.2f} TFLOP/s"
+        else:
+            stats["tflops"] = None
+            perf = "  |  TFLOP/s n/a"
     print(f"[bench] mean GPU : {stats['mean_gpu_ms']:.3f} ms{perf}")
 
     result = {

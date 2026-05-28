@@ -1,0 +1,43 @@
+{
+  "label": "example-reduction",
+  "device": "NVIDIA L4",
+  "config": {
+    "dtype": "fp32",
+    "inputs": [
+      [
+        "b",
+        [
+          1024,
+          1024
+        ]
+      ],
+      [
+        "x",
+        [
+          1024,
+          512
+        ]
+      ],
+      [
+        "y",
+        [
+          512,
+          1024
+        ]
+      ]
+    ],
+    "output": [
+      "o",
+      [
+        1024,
+        1024
+      ]
+    ]
+  },
+  "stats": {
+    "mean_gpu_ms": 2.519306182861328,
+    "iters": 200,
+    "failed": false,
+    "tflops": 0.42662158625725105
+  }
+}
