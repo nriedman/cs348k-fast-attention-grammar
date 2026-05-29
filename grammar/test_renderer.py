@@ -24,7 +24,11 @@ Usage
 
 from __future__ import annotations
 import argparse
+import atexit
+
+import os
 import sys
+import tempfile
 import types
 from dataclasses import dataclass
 from typing import Callable
@@ -33,8 +37,21 @@ import numpy as np
 
 from AST import (
     Program, ParallelLoop, Load, Store, Compute, ReductionLoop, SpatialLoop,
-    emit_module, CuTileRenderer, RenderCache, program_flops, structural_key,
+    emit_module, validate, CuTileRenderer, RenderCache, program_flops, structural_key,
 )
+
+# Generated kernels are written to real temp files (cuTile's JIT reads source
+# via inspect), tracked here and removed at exit.
+_TMP_FILES: list[str] = []
+
+
+@atexit.register
+def _cleanup_tmp() -> None:
+    for p in _TMP_FILES:
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
 
 
 # ==========================================================================
@@ -54,6 +71,7 @@ def _install_cpu_mock() -> None:
     ct.kernel = lambda fn: fn
     ct.bid = lambda n: ctx["bid"][n]
     ct.load = lambda t, idx, shape: t[_slices(idx, shape)].copy()
+    ct.extract = lambda x, idx, shape: x[_slices(idx, shape)].copy()
 
     def _store(t, idx, val):
         t[_slices(idx, tuple(val.shape))] = val
@@ -189,10 +207,32 @@ class Case:
     atol: float = 1e-3
 
 
+import importlib.util
+
+_exec_seq = 0
+
+
 def _exec_module(src: str) -> dict:
-    ns: dict = {"__name__": "_generated"}     # not "__main__": skip the demo block
-    exec(compile(src, "<generated>", "exec"), ns)
-    return ns
+    """Import a generated module as a REAL, sys.modules-registered module.
+
+    cuTile's JIT introspects each @ct.kernel via its __module__/__globals__ and
+    annotations to resolve ConstInt params to compile-time constants. A bare
+    `exec(src, {})` gives functions whose module isn't registered, so cuTile
+    can't see the ConstInt typing and reports shapes as 'not constant'. A real
+    importlib import (unique name per module) fixes that and also gives
+    inspect.getsource a real file to read."""
+    global _exec_seq
+    _exec_seq += 1
+    modname = f"gen_kernel_{_exec_seq}"
+    fd, path = tempfile.mkstemp(prefix=modname + "_", suffix=".py")
+    with os.fdopen(fd, "w") as f:
+        f.write(src)
+    _TMP_FILES.append(path)
+    spec = importlib.util.spec_from_file_location(modname, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[modname] = mod                 # register so func.__module__ resolves
+    spec.loader.exec_module(mod)               # __name__ != "__main__": skips the demo
+    return vars(mod)
 
 
 def run_case(case: Case, cp, is_gpu: bool, refmath, verbose: bool):
@@ -351,6 +391,15 @@ def p_batched_4d_relu():         # 4-D output -> grid collapse/decode
                                  [x, r, Store("y", r, ["b0", "b1", "n", "m"])])])
 
 
+def p_extract_matmul():          # full loads OUTSIDE reduction, ct.extract per k
+    x, y = Load("x", ["n", "k"]), Load("y", ["k", "m"])     # loaded whole (full K)
+    mm = Compute("matmul", [x, y])
+    red = ReductionLoop("k", 32, [mm], mm)                  # x,y are outer -> extracted
+    return Program({"x": (256, 128), "y": (128, 256), "c": (256, 256)},
+                   [ParallelLoop("c", (64, 64), ("n", "m"),
+                                 [x, y, red, Store("c", red, ["n", "m"])])])
+
+
 CASES = [
     Case("elementwise_add",     p_elementwise_add,     lambda M, i: M.add(i["a"], i["b"])),
     Case("relu",                p_relu,                lambda M, i: M.relu(i["a"])),
@@ -361,11 +410,16 @@ CASES = [
     Case("matmul_reduction",    p_matmul_reduction,    lambda M, i: M.matmul(i["x"], i["y"])),
     Case("spatial_relu",        p_spatial_relu,        lambda M, i: M.relu(i["a"])),
     Case("load_outside",        p_load_outside,        lambda M, i: M.relu(i["a"])),
-    Case("store_outside",       p_store_outside,       lambda M, i: M.relu(i["a"])),
+    Case("extract_matmul",      p_extract_matmul,      lambda M, i: M.matmul(i["x"], i["y"])),
     Case("reduction_in_spatial", p_reduction_in_spatial, lambda M, i: M.matmul(i["x"], i["y"])),
-    Case("spatial_in_reduction", p_spatial_in_reduction, lambda M, i: M.matmul(i["x"], i["y"])),
     Case("fused_matmul_add",    p_fused_matmul_add,    lambda M, i: M.add(M.matmul(i["x"], i["y"]), i["b"])),
     Case("batched_4d_relu",     p_batched_4d_relu,     lambda M, i: M.relu(i["x"])),
+]
+
+# Programs that MUST be rejected by validate() (inner->outer flow / forbidden nesting).
+REJECT_CASES = [
+    ("store_outside",       p_store_outside),       # Store after a SpatialLoop
+    ("spatial_in_reduction", p_spatial_in_reduction),  # SpatialLoop inside ReductionLoop
 ]
 
 
@@ -387,15 +441,17 @@ def property_checks():
     results.append(("flops_matmul", exact and flops == 2 * 256 * 256 * 128,
                     f"flops={flops} exact={exact}"))
 
-    # 3. inline renderer produces source for every case without raising.
-    ok_inline, bad = True, None
+    # 3. emit_module produces source for every positive case without raising.
+    #    (The inline CuTileRenderer.render path is display-only and not yet
+    #    ported to the ct.extract model; emit_module is the path that compiles.)
+    ok_emit, bad = True, None
     for c in CASES:
         try:
-            CuTileRenderer().render(c.build())
+            emit_module(c.build())
         except Exception as e:                   # pragma: no cover
-            ok_inline, bad = False, f"{c.name}: {e}"
+            ok_emit, bad = False, f"{c.name}: {e}"
             break
-    results.append(("inline_render_smoke", ok_inline, bad or "all cases rendered"))
+    results.append(("emit_module_smoke", ok_emit, bad or "all cases emitted"))
     return results
 
 
@@ -431,6 +487,16 @@ def main():
 
     if not args.filter:
         print("-" * 64)
+        for name, build in REJECT_CASES:
+            try:
+                validate(build())
+                ok, msg = False, "validate() accepted a program it should reject"
+            except ValueError as e:
+                ok, msg = True, f"rejected: {str(e)[:48]}..."
+            mark = "PASS" if ok else "FAIL"
+            print(f"  [{mark}] reject:{name:<15} {msg}")
+            passed += 1 if ok else 0
+            failed += 0 if ok else 1
         for name, ok, msg in property_checks():
             mark = "PASS" if ok else "FAIL"
             print(f"  [{mark}] {name:<22} {msg}")

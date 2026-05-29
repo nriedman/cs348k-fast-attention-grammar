@@ -193,24 +193,6 @@ def _resolve_index(index: list[str], tile_shape: Shape, global_shape: Shape,
     return out
 
 
-def _partial_subtiles(src, base: dict[str, int]) -> dict[str, int]:
-    """If `src` is a ReductionLoop, find SpatialLoops between it and its partial
-    and return `base` augmented with their subtile sizes -- so the partial is
-    inferred at its own (deeper) scope while the accumulator stays at `base`."""
-    if not isinstance(src, ReductionLoop):
-        return base
-    sub = dict(base)
-    def walk(stmts):
-        for s in stmts:
-            if isinstance(s, SpatialLoop):
-                sub[s.axis] = s.tile
-                walk(s.body)
-            elif isinstance(s, ReductionLoop):
-                walk(s.body)
-    walk(src.body)
-    return sub
-
-
 # --------------------------------------------------------------------------
 # Renderer: external visitor. Runs backward shape inference per kernel, then
 # emits cuTile-ish code.
@@ -226,10 +208,7 @@ class CuTileRenderer:
 
     # ---- shape inference (each value resolved at its OWN lexical scope) ----
     def _infer(self, value: Value, out_shape: Shape, tensors: dict[str, Shape],
-               reduce_tile: int | None = None,
-               subtiles: dict[str, int] | None = None,
-               index_vars: tuple[str, ...] = ()) -> None:
-        subtiles = subtiles or {}
+               reduce_tile: int | None = None) -> None:
         prev = self.shapes.get(id(value))
         if prev is not None:
             assert prev == out_shape, (
@@ -238,14 +217,10 @@ class CuTileRenderer:
             return
         self.shapes[id(value)] = out_shape
         if isinstance(value, ReductionLoop):
-            # The accumulator (this loop's result) has `out_shape` -- the output
-            # tile at the reduction's own scope. The partial may live deeper
-            # (inside a SpatialLoop), so re-narrow its seed by `subtiles` before
-            # descending, and tile the contraction by `tile`.
-            pshape = tuple(min(out_shape[d], subtiles.get(v, out_shape[d]))
-                           for d, v in enumerate(index_vars)) if index_vars else out_shape
-            self._infer(value.partial, pshape, tensors, reduce_tile=value.tile,
-                        subtiles=subtiles, index_vars=index_vars)
+            # The accumulator (this loop's result) and its partial share this
+            # scope -- a SpatialLoop can't sit between them (validate() forbids
+            # SpatialLoop-in-ReductionLoop). Tile the contraction by `tile`.
+            self._infer(value.partial, out_shape, tensors, reduce_tile=value.tile)
         elif isinstance(value, Compute):
             operand_globals = [
                 tensors.get(i.source) if isinstance(i, Load) else None
@@ -307,9 +282,7 @@ class CuTileRenderer:
             if isinstance(s, Store):
                 seed = tuple(subtiles.get(v, loop.tile_shape[d])
                              for d, v in enumerate(loop.index_vars))
-                self._infer(s.src, seed, self._tensors,
-                            subtiles=_partial_subtiles(s.src, subtiles),
-                            index_vars=loop.index_vars)
+                self._infer(s.src, seed, self._tensors)
             elif isinstance(s, SpatialLoop):
                 self._seed_shapes(s.body, loop, {**subtiles, s.axis: s.tile})
             elif isinstance(s, ReductionLoop):
@@ -516,13 +489,52 @@ def _tup(parts: list[str]) -> str:
 
 
 def _infer_program(program: Program) -> dict[int, Shape]:
-    """Run backward shape inference over every kernel; return id->tile shape."""
+    """Run shape inference over every kernel; return id->tile shape.
+
+    Backward demand (op footprint) gives the per-axis extent a value's
+    consumers need; then each Load is re-resolved at its OWN lexical scope, so a
+    Load placed outside a loop materialises the full (un-narrowed) extent on that
+    loop's axis and the loop bridges with ct.extract. Without this, a Load lifted
+    out of a reduction/spatial loop would be wrongly narrowed to the subtile."""
     r = CuTileRenderer()
     r._tensors = program.tensors
     for loop in program.body:
         r._scope = set(loop.index_vars)
-        r._seed_shapes(loop.body, loop, {})    # narrows seeds through SpatialLoops
+        r._seed_shapes(loop.body, loop, {})
+
+    # re-resolve each Load at its lexical scope: an axis subtiled only by a loop
+    # the Load is NOT inside stays at full extent.
+    def fix(stmts, loop, sub_axes: set[str], red_axes: set[str]):
+        for s in stmts:
+            if isinstance(s, Load):
+                g = program.tensors[s.source]
+                shp = []
+                for d, a in enumerate(s.index):
+                    if a in loop.index_vars:           # output axis: TS, or SUB if inside
+                        base = loop.tile_shape[loop.index_vars.index(a)]
+                        shp.append(r.shapes[id(s)][d] if a in sub_axes else base)
+                    else:                              # contraction axis
+                        shp.append(r.shapes[id(s)][d] if a in red_axes else g[d])
+                r.shapes[id(s)] = tuple(shp)
+            elif isinstance(s, SpatialLoop):
+                fix(s.body, loop, sub_axes | {s.axis}, red_axes)
+            elif isinstance(s, ReductionLoop):
+                fix(s.body, loop, sub_axes, red_axes | {s.axis})
+
+    for loop in program.body:
+        fix(loop.body, loop, set(), set())
     return r.shapes
+
+
+def _loads_feeding(v: Value):
+    """Yield Load nodes in the dataflow that feeds value `v` (transitively)."""
+    if isinstance(v, Load):
+        yield v
+    elif isinstance(v, Compute):
+        for i in v.inputs:
+            yield from _loads_feeding(i)
+    elif isinstance(v, ReductionLoop):
+        yield from _loads_feeding(v.partial)
 
 
 def _iter_loads(stmts):
@@ -576,8 +588,7 @@ def _emit_kernel(loop: ParallelLoop, tensors: dict[str, Shape],
     red_tiles: list[str] = []       # reduction TS_<axis> params, in encounter order
     sub_tiles: list[str] = []       # spatial SUB_TS_<axis> params, in encounter order
     names: dict[int, str] = {}
-    mat_frames: dict[int, dict[str, list]] = {}   # id(value) -> spatial frames at its scope
-    _node_by_id = {id(s): s for s in _all_nodes(loop.body)}
+    mat_frames: dict[int, dict[str, list]] = {}   # id(value) -> active frames at its scope
     counter = 0
 
     def fresh(prefix: str = "t") -> str:
@@ -585,114 +596,98 @@ def _emit_kernel(loop: ParallelLoop, tensors: dict[str, Shape],
         counter += 1
         return f"{prefix}{counter}"
 
+    # active subtiling frames per axis (outer->inner), pushed by SpatialLoops and
+    # the ReductionLoop. Each frame is (subtile_index_var, subtile_shape_sym).
+    # A value materialized when fewer frames were active is reached from a deeper
+    # scope by a ct.extract that names the per-frame subtile index.
     active_sub: dict[str, str] = {}   # axis -> SUB_TS_<axis> while inside its SpatialLoop
-    # active spatial frames per axis: list of (subtile_sym, iter_var) outer->inner,
-    # used to compute element-offset slices when a value is accessed from a scope
-    # deeper than where it was materialized.
-    spatial_frames: dict[str, list[tuple[str, str]]] = {}
-
-    def slice_for(mat_frames: dict[str, list], axes: list[str]) -> str | None:
-        """Element-slice expr to view a value materialized with `mat_frames`
-        (frames per axis at its scope) from the CURRENT scope. Returns None if
-        no axis is narrowed between the two (whole value), else '[s0, s1, ...]'.
-        Offset within the value = sum(iter_i * subtile_i) over frames deeper
-        than materialization; size = innermost current subtile."""
-        parts, any_slice = [], False
-        for a in axes:
-            cur = spatial_frames.get(a, [])
-            mat = mat_frames.get(a, [])
-            if len(cur) > len(mat):                 # narrowed since materialization
-                deeper = cur[len(mat):]
-                off = " + ".join(f"{it} * {sub}" for sub, it in deeper)
-                size = deeper[-1][0]                # innermost subtile size
-                parts.append(f"{off} : {off} + {size}" if off else f":{size}")
-                any_slice = True
-            else:
-                parts.append(":")
-            # NOTE: only output (spatial) axes can be sliced here; contraction
-            # axes never appear in a stored/accumulated value's axis list.
-        return f"[{', '.join(parts)}]" if any_slice else None
+    frames: dict[str, list[tuple[str, str]]] = {}   # axis -> [(index_var, shape_sym)]
 
     def sym_shape(index, tile_shape, global_shape) -> list[str]:
         out = []
         for nm, t, g in zip(index, tile_shape, global_shape):
             if t < g:
-                if nm in active_sub:               # narrowed by an enclosing SpatialLoop
-                    s = active_sub[nm]; tiles[s] = t
-                else:
-                    s = f"TS_{nm}"; tiles[s] = t
+                s = active_sub.get(nm, f"TS_{nm}"); tiles[s] = t
                 out.append(s)
             else:
                 s = nm.upper(); extents[s] = g; out.append(s)
         return out
 
     def reduction_extent(rl: ReductionLoop):
+        # the k-extent comes from any load feeding the partial that indexes `axis`
+        # -- that load may sit OUTSIDE the loop (extracted in), so search inputs.
+        for ld in _loads_feeding(rl.partial):
+            if rl.axis in ld.index:
+                return rl.axis.upper(), tensors[ld.source][ld.index.index(rl.axis)]
         for s in _iter_loads(rl.body):
             if rl.axis in s.index:
                 return rl.axis.upper(), tensors[s.source][s.index.index(rl.axis)]
         raise ValueError(f"reduction axis {rl.axis!r} not found in any body load")
 
     def snapshot() -> dict[str, list]:
-        return {a: list(f) for a, f in spatial_frames.items() if f}
+        return {a: list(f) for a, f in frames.items() if f}
 
-    def read(v: Value) -> str:
-        """Name of value `v` as seen from the CURRENT scope: sliced if `v` was
-        materialized at a shallower scope (load-outside / outer intermediate)."""
+    def read(v: Value, ind: str, out: list) -> str:
+        """Tile `v` as seen from the CURRENT scope. If `v` was materialized at a
+        shallower scope (an axis was subtiled in between), emit a ct.extract to
+        produce the subtile -- tiles are immutable, so this is a new tile, never
+        a view. Otherwise the value is used directly. (One subtiling level per
+        axis between materialization and use; deeper nesting on one axis would
+        compose the index, which validate() can require not to occur for now.)"""
         nm = names[id(v)]
-        sl = slice_for(mat_frames.get(id(v), {}), _value_axes(v))
-        return f"{nm}{sl}" if sl else nm
+        axes = _value_axes(v)
+        mat = mat_frames.get(id(v), {})
+        idx, shp, need = [], [], False
+        for a in axes:
+            cur, m = frames.get(a, []), mat.get(a, [])
+            if len(cur) > len(m):                       # narrowed since materialization
+                need = True
+                ivar, sh = cur[len(m)]                  # first frame deeper than mat
+                idx.append(ivar)
+                shp.append(sh)
+            else:
+                idx.append("0")
+                shp.append(active_sub.get(a, f"TS_{a}") if a in scope else a.upper())
+        if not need:
+            return nm
+        s = fresh()
+        out.append(f"{ind}{s} = ct.extract({nm}, {_tup(idx)}, {_tup(shp)})")
+        return s
 
-    def emit_stmts(stmts, ind, acc_for=None, scatter=None) -> list[str]:
-        scatter = scatter or {}
+    def emit_stmts(stmts, ind, acc_for=None) -> list[str]:
         out: list[str] = []
         for stmt in stmts:
             if isinstance(stmt, Load):
+                v = fresh(); names[id(stmt)] = v
                 mat_frames[id(stmt)] = snapshot()
                 ts, g = shapes[id(stmt)], tensors[stmt.source]
                 idx = _resolve_index(stmt.index, ts, g, scope, f"load {stmt.source}", coords)
                 shp = sym_shape(stmt.index, ts, g)
-                rhs = f"ct.load({stmt.source}, {_tup(idx)}, {_tup(shp)})"
-                if id(stmt) in scatter:                # produced here, used outside
-                    b = scatter[id(stmt)]
-                    sl = slice_for({}, _value_axes(stmt))   # current-scope slice of buf
-                    out.append(f"{ind}{b}{sl or ''} = {rhs}")
-                else:
-                    v = fresh(); names[id(stmt)] = v
-                    out.append(f"{ind}{v} = {rhs}")
+                out.append(f"{ind}{v} = ct.load({stmt.source}, {_tup(idx)}, {_tup(shp)})")
             elif isinstance(stmt, Compute):
-                args = [read(i) for i in stmt.inputs]
+                args = [read(i, ind, out) for i in stmt.inputs]
                 if acc_for is not None and stmt is acc_for[0]:   # the accumulated partial
-                    _, acc, acc_axes, acc_frames = acc_for
+                    _, acc = acc_for
                     if stmt.op not in REDUCE_RULES:
                         raise ValueError(
                             f"op {stmt.op!r} cannot be a reduction partial; "
                             f"reducible: {sorted(REDUCE_RULES)}")
-                    sl = slice_for(acc_frames, acc_axes)
-                    tgt = f"{acc}{sl}" if sl else acc
-                    names[id(stmt)] = acc
-                    out.append(f"{ind}{tgt} = {REDUCE_RULES[stmt.op][1](args, tgt)}")
-                elif id(stmt) in scatter:              # produced here, used outside
-                    b = scatter[id(stmt)]
-                    sl = slice_for({}, _value_axes(stmt))
-                    out.append(f"{ind}{b}{sl or ''} = {EMIT_RULES[stmt.op](args)}")
+                    names[id(stmt)] = acc                # whole-tile rebind (immutable)
+                    out.append(f"{ind}{acc} = {REDUCE_RULES[stmt.op][1](args, acc)}")
                 else:
                     v = fresh(); names[id(stmt)] = v
                     mat_frames[id(stmt)] = snapshot()
                     out.append(f"{ind}{v} = {EMIT_RULES[stmt.op](args)}")
             elif isinstance(stmt, ReductionLoop):
-                acc = fresh("acc")                # unique name, avoids collisions
-                # accumulator shape == output tile AT THIS (the reduction's) scope:
-                # full TS per output dim, narrowed by any SpatialLoop enclosing
-                # the reduction (so reduction-inside-spatial gets a subtile acc,
-                # spatial-inside-reduction gets a full acc updated by slices).
-                acc_shape, acc_axes = [], list(loop.index_vars)
+                # accumulator: full output tile at THIS scope (narrowed by any
+                # SpatialLoop enclosing the reduction). No SpatialLoop may live
+                # INSIDE -- enforced by validate() -- so it is never partially
+                # written; every iteration rebinds the whole tile.
+                acc = fresh("acc")
+                acc_shape = []
                 for d, vv in enumerate(loop.index_vars):
-                    if vv in active_sub:
-                        s = active_sub[vv]
-                    else:
-                        s = f"TS_{vv}"
+                    s = active_sub.get(vv, f"TS_{vv}")
                     tiles[s] = shapes[id(stmt)][d]; acc_shape.append(s)
-                acc_frames = {a: list(spatial_frames.get(a, [])) for a in acc_axes}
                 init_fn = REDUCE_RULES[stmt.partial.op][0]
                 out.append(f"{ind}{acc} = {init_fn(_tup(acc_shape), f'{loop.out}.dtype')}")
                 k_sym, k_val = reduction_extent(stmt)
@@ -702,53 +697,38 @@ def _emit_kernel(loop: ParallelLoop, tensors: dict[str, Shape],
                     red_tiles.append(ts_sym)
                 out.append(f"{ind}for {stmt.axis} in range(ct.cdiv({k_sym}, {ts_sym})):")
                 scope.add(stmt.axis)
-                out += emit_stmts(stmt.body, ind + "    ",
-                                  acc_for=(stmt.partial, acc, acc_axes, acc_frames))
+                frames.setdefault(stmt.axis, []).append((stmt.axis, ts_sym))
+                out += emit_stmts(stmt.body, ind + "    ", acc_for=(stmt.partial, acc))
+                frames[stmt.axis].pop()
                 scope.discard(stmt.axis)
-                names[id(stmt)] = acc                 # the loop's result
-                mat_frames[id(stmt)] = acc_frames
+                names[id(stmt)] = acc                    # the loop's result
+                mat_frames[id(stmt)] = snapshot()
             elif isinstance(stmt, SpatialLoop):
-                ts_sym = f"TS_{stmt.axis}"           # parent tile (output dim) -> param
-                par = active_sub.get(stmt.axis, f"TS_{stmt.axis}")  # parent extent sym
+                ts_sym = f"TS_{stmt.axis}"
+                par = active_sub.get(stmt.axis, f"TS_{stmt.axis}")
                 tiles[ts_sym] = loop.tile_shape[list(loop.index_vars).index(stmt.axis)]
                 sub_sym = f"SUB_TS_{stmt.axis}"; tiles[sub_sym] = stmt.tile
                 if sub_sym not in sub_tiles:
                     sub_tiles.append(sub_sym)
-                # store-outside: any value produced in this loop's body but read
-                # by a sibling AFTER the loop needs a buffer at THIS scope, full
-                # on `stmt.axis`, scattered into each iteration. (ct.alloc: no
-                # init, every element is written.)
-                outside = _produced_in(stmt.body) & _read_after(stmts, stmt)
-                bufs = {}
-                for vid in outside:
-                    b = fresh("buf")
-                    axes = _value_axes(_node_by_id[vid])
-                    bshape = [_sym_extent(a, active_sub, loop) for a in axes]
-                    out.append(f"{ind}{b} = ct.alloc({_tup(bshape)}, dtype={loop.out}.dtype)")
-                    bufs[vid] = b
-                it = fresh(f"st_{stmt.axis}_"); coord = fresh(f"s{stmt.axis}_")
+                it, coord = fresh(f"st_{stmt.axis}_"), fresh(f"s{stmt.axis}_")
                 out.append(f"{ind}for {it} in range(ct.cdiv({par}, {sub_sym})):")
-                base = coords.get(stmt.axis, stmt.axis)   # compose with parent coord
+                base = coords.get(stmt.axis, stmt.axis)
                 out.append(f"{ind}    {coord} = {base} * ({par} // {sub_sym}) + {it}")
                 saved, saved_sub = coords.get(stmt.axis), active_sub.get(stmt.axis)
                 coords[stmt.axis] = coord
                 active_sub[stmt.axis] = sub_sym
-                spatial_frames.setdefault(stmt.axis, []).append((sub_sym, it))
-                out += emit_stmts(stmt.body, ind + "    ", acc_for=acc_for,
-                                  scatter=bufs)
-                spatial_frames[stmt.axis].pop()
-                # expose each buffer at the outer scope as the value's name
-                for vid, b in bufs.items():
-                    names[vid] = b
-                    mat_frames[vid] = {a: list(f) for a, f in spatial_frames.items() if f}
+                frames.setdefault(stmt.axis, []).append((it, sub_sym))
+                out += emit_stmts(stmt.body, ind + "    ", acc_for=acc_for)
+                frames[stmt.axis].pop()
                 if saved is None: coords.pop(stmt.axis, None)
                 else: coords[stmt.axis] = saved
                 if saved_sub is None: active_sub.pop(stmt.axis, None)
                 else: active_sub[stmt.axis] = saved_sub
             elif isinstance(stmt, Store):
+                src = read(stmt.src, ind, out)           # extract if produced shallower
                 ts, g = shapes[id(stmt.src)], tensors[stmt.dest]
                 idx = _resolve_index(stmt.index, ts, g, scope, f"store {stmt.dest}", coords)
-                out.append(f"{ind}ct.store({stmt.dest}, {_tup(idx)}, {read(stmt.src)})")
+                out.append(f"{ind}ct.store({stmt.dest}, {_tup(idx)}, {src})")
         return out
 
     body: list[str] = []
@@ -788,63 +768,6 @@ def _iter_spatial(stmts):
             yield from _iter_spatial(s.body)
         elif isinstance(s, ReductionLoop):
             yield from _iter_spatial(s.body)
-
-
-def _all_nodes(stmts):
-    """Every node anywhere in a body, descending into loop bodies."""
-    for s in stmts:
-        yield s
-        if isinstance(s, (SpatialLoop, ReductionLoop)):
-            yield from _all_nodes(s.body)
-
-
-def _produced_in(stmts) -> set:
-    """ids of Load/Compute values produced anywhere inside `stmts`."""
-    out = set()
-    for s in stmts:
-        if isinstance(s, (Load, Compute)):
-            out.add(id(s))
-        if isinstance(s, (SpatialLoop, ReductionLoop)):
-            out |= _produced_in(s.body)
-        if isinstance(s, ReductionLoop):
-            out.add(id(s))
-    return out
-
-
-def _read_after(sibling_stmts, after_node) -> set:
-    """ids of values read by any sibling that comes AFTER `after_node` in the
-    same body (their data must survive the loop -> a buffer at this scope)."""
-    seen_after, reads = False, set()
-    def operands(s):
-        if isinstance(s, Compute): return [id(i) for i in s.inputs]
-        if isinstance(s, Store):   return [id(s.src)]
-        return []
-    for s in sibling_stmts:
-        if seen_after:
-            reads.update(operands(s))
-            if isinstance(s, (SpatialLoop, ReductionLoop)):
-                reads |= {id(x) for x in _read_targets(s.body)}
-        if s is after_node:
-            seen_after = True
-    return reads
-
-
-def _read_targets(stmts) -> list:
-    out = []
-    for s in stmts:
-        if isinstance(s, Compute): out += s.inputs
-        elif isinstance(s, Store): out.append(s.src)
-        elif isinstance(s, (SpatialLoop, ReductionLoop)): out += _read_targets(s.body)
-    return out
-
-
-def _sym_extent(axis, active_sub, loop) -> str:
-    """Symbolic extent of `axis` at the CURRENT (outer, pre-loop) scope."""
-    if axis in active_sub:
-        return active_sub[axis]
-    if axis in loop.index_vars:
-        return f"TS_{axis}"
-    return axis.upper()
 
 
 def _value_axes(v: Value) -> list[str]:
@@ -898,7 +821,70 @@ def program_flops(program: Program, shapes: dict[int, Shape] | None = None):
     return total, exact
 
 
+def validate(program: Program) -> None:
+    """Enforce the invariants that keep emission within cuTile's tile model:
+
+      1. A SpatialLoop may not be nested inside a ReductionLoop. The reverse
+         (ReductionLoop in SpatialLoop) is fine. Spatial-in-reduction would
+         require partially writing an accumulator (or N accumulators), which
+         cuTile's immutable tiles don't support.
+      2. No value is consumed at a scope SHALLOWER than where it is produced.
+         Tiles are immutable and flow outer->inner via ct.extract; there is no
+         inner->outer flow (a Store consuming a subtile must sit inside the
+         loop, the accumulator is reduced and consumed at its own scope).
+
+    Raises ValueError on violation."""
+    # 1. structural: no SpatialLoop under any ReductionLoop
+    def check_no_spatial(stmts, in_reduction: bool):
+        for s in stmts:
+            if isinstance(s, SpatialLoop):
+                if in_reduction:
+                    raise ValueError(
+                        "SpatialLoop nested inside a ReductionLoop is not "
+                        "supported (would require partial accumulator writes); "
+                        "put the ReductionLoop inside the SpatialLoop instead")
+                check_no_spatial(s.body, in_reduction)
+            elif isinstance(s, ReductionLoop):
+                check_no_spatial(s.body, True)
+
+    # 2. dataflow: a value's producer scope must enclose (or equal) every
+    #    consumer scope -- never the other way around.
+    def depth_map(stmts, path, out):
+        for s in stmts:
+            out[id(s)] = path
+            if isinstance(s, (SpatialLoop, ReductionLoop)):
+                depth_map(s.body, path + (s,), out)
+
+    for loop in program.body:
+        check_no_spatial(loop.body, False)
+        scopes: dict[int, tuple] = {}
+        depth_map(loop.body, (), scopes)
+        for s in _all_nodes(loop.body):
+            if isinstance(s, ReductionLoop):
+                continue          # partial lives inside by design (accumulator rebind)
+            consumers = (s.inputs if isinstance(s, Compute)
+                         else [s.src] if isinstance(s, Store) else [])
+            for src in consumers:
+                psc, csc = scopes.get(id(src)), scopes.get(id(s))
+                if psc is None or csc is None:
+                    continue
+                # producer scope must be a prefix of (enclose) consumer scope
+                if len(psc) > len(csc) or psc != csc[:len(psc)]:
+                    raise ValueError(
+                        f"value produced in a deeper scope than its consumer "
+                        f"({type(src).__name__} -> {type(s).__name__}); a tile "
+                        f"cannot flow inner->outer (move the consumer inside)")
+
+
+def _all_nodes(stmts):
+    for s in stmts:
+        yield s
+        if isinstance(s, (SpatialLoop, ReductionLoop)):
+            yield from _all_nodes(s.body)
+
+
 def emit_module(program: Program, fn_name: str = "fn") -> str:
+    validate(program)
     shapes = _infer_program(program)
     inputs, intermediates, outputs = _program_io(program)
     if not outputs:
