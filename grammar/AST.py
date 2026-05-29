@@ -79,6 +79,23 @@ class ReductionLoop(Stmt, Value):
     partial: Value = None          # the body Compute accumulated each iteration
 
 
+@dataclass
+class SpatialLoop(Stmt):
+    """A sequential loop that subdivides ONE output tile dimension further.
+
+    `axis` is one of the enclosing ParallelLoop's index_vars (already grid-
+    tiled at TS_<axis>); the loop walks that block's tile in `tile`-sized
+    (SUB_TS_<axis>) disjoint subtiles, computing one per iteration. The grid is
+    unchanged. Unlike ReductionLoop it is NOT a Value: it has no accumulator
+    and produces nothing -- each iteration independently stores its subtile.
+    Inside the body, `axis` resolves to a composed coordinate
+        s<axis> = <axis> * (TS_<axis> // SUB_TS_<axis>) + st_<axis>
+    and its active extent narrows from TS_<axis> to SUB_TS_<axis>."""
+    axis: str                      # output index_var being subtiled, e.g. "n"
+    tile: int                      # subtile size along `axis` (SUB_TS_<axis>, tunable)
+    body: list[Stmt] = field(default_factory=list)
+
+
 # --------------------------------------------------------------------------
 # Backward shape rules: given an op's OUTPUT tile shape (and the global shapes
 # of its operands, for dims the output projects away), return the required
@@ -149,13 +166,17 @@ REDUCE_RULES = {
 
 
 def _resolve_index(index: list[str], tile_shape: Shape, global_shape: Shape,
-                   scope: set[str], what: str) -> list[str]:
+                   scope: set[str], what: str,
+                   coords: dict[str, str] | None = None) -> list[str]:
     """Turn per-dim index NAMES into emitted tile coordinates.
 
     A dim is *tiled* iff its inferred tile is smaller than the global dim; then
-    its name must name a live index in `scope` and we emit that name. Otherwise
-    the dim is loaded/stored whole and collapses to tile index 0 -- the name is
-    then a latent axis (e.g. a reduction index not yet wrapped in a loop)."""
+    its name must name a live index in `scope` and we emit that name's coordinate
+    (an axis subtiled by a SpatialLoop resolves to a composed expression via
+    `coords`, e.g. n -> sn; otherwise the name is its own coordinate, e.g. a grid
+    var). Otherwise the dim is loaded/stored whole and collapses to tile index 0
+    -- the name is then a latent axis (e.g. a reduction index not yet looped)."""
+    coords = coords or {}
     assert len(index) == len(tile_shape) == len(global_shape), (
         f"{what}: index rank {len(index)} must match tensor rank {len(global_shape)}"
     )
@@ -166,7 +187,7 @@ def _resolve_index(index: list[str], tile_shape: Shape, global_shape: Shape,
                 raise ValueError(
                     f"{what}: dim {d} is tiled ({t} of {g}) but index name "
                     f"{name!r} is not in scope {sorted(scope)}")
-            out.append(name)
+            out.append(coords.get(name, name))
         else:                                       # whole dim -> single tile
             out.append("0")
     return out
@@ -184,6 +205,7 @@ class CuTileRenderer:
         self.shapes: dict[int, Shape] = {}   # id(value) -> inferred tile shape
         self.names: dict[int, str] = {}      # id(value) -> emitted var name
         self._n = 0
+        self._coords: dict[str, str] = {}    # axis -> composed coordinate expr
 
     # ---- shape inference (backward from each Store) ----
     def _infer(self, value: Value, out_shape: Shape, tensors: dict[str, Shape],
@@ -232,10 +254,12 @@ class CuTileRenderer:
         self._tensors = tensors
         self._scope = set(loop.index_vars)   # live tile indices (grid vars for now)
         self._cur_out = loop.out             # output tensor (for accumulator dtype)
-        # 1. infer every tile shape, seeded by the output tile at each Store.
-        for stmt in loop.body:
-            if isinstance(stmt, Store):
-                self._infer(stmt.src, tuple(loop.tile_shape), tensors)
+        self._coords = {}
+        self._parent_tile = {v: loop.tile_shape[d]     # TS_<axis> per output axis
+                             for d, v in enumerate(loop.index_vars)}
+        # 1. infer every tile shape, seeded by each Store. The seed is the output
+        #    tile, narrowed on any axis subtiled by an enclosing SpatialLoop.
+        self._seed_shapes(loop.body, loop, {})
         # 2. emit the kernel.
         args = ", ".join(_loop_tensors(loop))
         grid = tuple(
@@ -250,6 +274,17 @@ class CuTileRenderer:
             self._visit(stmt)
         self.indent -= 1
         self.lines.append("")
+
+    def _seed_shapes(self, stmts, loop: ParallelLoop, subtiles: dict[str, int]) -> None:
+        """Walk a body, seeding _infer at each Store with the output tile shape
+        narrowed by `subtiles` (axis -> SUB_TS for enclosing SpatialLoops)."""
+        for s in stmts:
+            if isinstance(s, Store):
+                seed = tuple(subtiles.get(v, loop.tile_shape[d])
+                             for d, v in enumerate(loop.index_vars))
+                self._infer(s.src, seed, self._tensors)
+            elif isinstance(s, SpatialLoop):
+                self._seed_shapes(s.body, loop, {**subtiles, s.axis: s.tile})
 
     def _visit(self, node: Node) -> None:
         getattr(self, f"_visit_{type(node).__name__}")(node)
@@ -291,7 +326,7 @@ class CuTileRenderer:
         self.names[id(n)] = nm
         shp = self.shapes[id(n)]
         idx = _resolve_index(n.index, shp, self._tensors[n.source],
-                             self._scope, f"load {n.source}")
+                             self._scope, f"load {n.source}", self._coords)
         self._emit(f"{nm} = ct.load({n.source}, ({', '.join(idx)}), {shp})")
 
     def _visit_Compute(self, n: Compute) -> None:
@@ -308,7 +343,7 @@ class CuTileRenderer:
     def _visit_Store(self, n: Store) -> None:
         shp = self.shapes[id(n.src)]
         idx = _resolve_index(n.index, shp, self._tensors[n.dest],
-                             self._scope, f"store {n.dest}")
+                             self._scope, f"store {n.dest}", self._coords)
         self._emit(
             f"ct.store({n.dest}, ({', '.join(idx)}), {self._name(n.src)})"
             f"  # tile {shp}"
@@ -344,6 +379,25 @@ class CuTileRenderer:
         self._scope.discard(n.axis)
         self.indent -= 1
 
+    def _visit_SpatialLoop(self, n: "SpatialLoop") -> None:
+        ts = self._parent_tile[n.axis]          # parent tile size TS_<axis>
+        sub = n.tile                            # subtile size SUB_TS_<axis>
+        it = f"st_{n.axis}"                     # loop iterator
+        coord = f"s{n.axis}"                    # composed global subtile index
+        trips = -(-ts // sub)                   # cdiv(TS, SUB_TS), literal
+        self._emit(f"for {it} in range({trips}):")
+        self.indent += 1
+        self._emit(f"{coord} = {n.axis} * {ts // sub} + {it}")
+        saved = self._coords.get(n.axis)
+        self._coords[n.axis] = coord            # axis resolves to composed coord
+        for s in n.body:
+            self._visit(s)
+        if saved is None:
+            self._coords.pop(n.axis, None)
+        else:
+            self._coords[n.axis] = saved
+        self.indent -= 1
+
 
 # --------------------------------------------------------------------------
 # Structural key + cache: equivalent ASTs collapse to the same key, so we
@@ -375,6 +429,9 @@ def structural_key(node: Node, _memo: dict[int, tuple] | None = None) -> tuple:
         key = ("ReductionLoop", node.axis, node.tile,
                tuple(structural_key(c, _memo) for c in node.body),
                structural_key(node.partial, _memo))
+    elif isinstance(node, SpatialLoop):
+        key = ("SpatialLoop", node.axis, node.tile,
+               tuple(structural_key(c, _memo) for c in node.body))
     else:
         raise TypeError(f"unhashable node {type(node).__name__}")
 
@@ -435,18 +492,16 @@ def _infer_program(program: Program) -> dict[int, Shape]:
     r._tensors = program.tensors
     for loop in program.body:
         r._scope = set(loop.index_vars)
-        for stmt in loop.body:
-            if isinstance(stmt, Store):
-                r._infer(stmt.src, tuple(loop.tile_shape), program.tensors)
+        r._seed_shapes(loop.body, loop, {})    # narrows seeds through SpatialLoops
     return r.shapes
 
 
 def _iter_loads(stmts):
-    """Yield every Load, descending into ReductionLoop bodies."""
+    """Yield every Load, descending into ReductionLoop and SpatialLoop bodies."""
     for s in stmts:
         if isinstance(s, Load):
             yield s
-        elif isinstance(s, ReductionLoop):
+        elif isinstance(s, (ReductionLoop, SpatialLoop)):
             yield from _iter_loads(s.body)
 
 
@@ -486,9 +541,11 @@ def _emit_kernel(loop: ParallelLoop, tensors: dict[str, Shape],
     name = f"{loop.out}_kernel"
     targs = _loop_tensors(loop)
     scope = set(loop.index_vars)
+    coords: dict[str, str] = {}     # axis -> composed coordinate expr (spatial)
     tiles: dict[str, int] = {}      # TS_<axis> -> tile size
     extents: dict[str, int] = {}    # <AXIS>    -> full extent
     red_tiles: list[str] = []       # reduction TS_<axis> params, in encounter order
+    sub_tiles: list[str] = []       # spatial SUB_TS_<axis> params, in encounter order
     names: dict[int, str] = {}
     counter = 0
 
@@ -497,11 +554,17 @@ def _emit_kernel(loop: ParallelLoop, tensors: dict[str, Shape],
         counter += 1
         return f"{prefix}{counter}"
 
+    active_sub: dict[str, str] = {}   # axis -> SUB_TS_<axis> while inside its SpatialLoop
+
     def sym_shape(index, tile_shape, global_shape) -> list[str]:
         out = []
         for nm, t, g in zip(index, tile_shape, global_shape):
             if t < g:
-                s = f"TS_{nm}"; tiles[s] = t; out.append(s)
+                if nm in active_sub:               # narrowed by an enclosing SpatialLoop
+                    s = active_sub[nm]; tiles[s] = t
+                else:
+                    s = f"TS_{nm}"; tiles[s] = t
+                out.append(s)
             else:
                 s = nm.upper(); extents[s] = g; out.append(s)
         return out
@@ -518,7 +581,7 @@ def _emit_kernel(loop: ParallelLoop, tensors: dict[str, Shape],
             if isinstance(stmt, Load):
                 v = fresh(); names[id(stmt)] = v
                 ts, g = shapes[id(stmt)], tensors[stmt.source]
-                idx = _resolve_index(stmt.index, ts, g, scope, f"load {stmt.source}")
+                idx = _resolve_index(stmt.index, ts, g, scope, f"load {stmt.source}", coords)
                 shp = sym_shape(stmt.index, ts, g)
                 out.append(f"{ind}{v} = ct.load({stmt.source}, {_tup(idx)}, {_tup(shp)})")
             elif isinstance(stmt, Compute):
@@ -552,9 +615,27 @@ def _emit_kernel(loop: ParallelLoop, tensors: dict[str, Shape],
                 out += emit_stmts(stmt.body, ind + "    ", acc_for=(stmt.partial, acc))
                 scope.discard(stmt.axis)
                 names[id(stmt)] = acc                 # the loop's result
+            elif isinstance(stmt, SpatialLoop):
+                ts_sym = f"TS_{stmt.axis}"           # parent tile (output dim) -> param
+                tiles[ts_sym] = loop.tile_shape[list(loop.index_vars).index(stmt.axis)]
+                sub_sym = f"SUB_TS_{stmt.axis}"; tiles[sub_sym] = stmt.tile
+                if sub_sym not in sub_tiles:
+                    sub_tiles.append(sub_sym)
+                it, coord = f"st_{stmt.axis}", f"s{stmt.axis}"
+                out.append(f"{ind}for {it} in range(ct.cdiv({ts_sym}, {sub_sym})):")
+                out.append(f"{ind}    {coord} = {stmt.axis} * ({ts_sym} // {sub_sym}) + {it}")
+                saved = coords.get(stmt.axis)
+                saved_sub = active_sub.get(stmt.axis)
+                coords[stmt.axis] = coord
+                active_sub[stmt.axis] = sub_sym
+                out += emit_stmts(stmt.body, ind + "    ", acc_for=acc_for)
+                if saved is None: coords.pop(stmt.axis, None)
+                else: coords[stmt.axis] = saved
+                if saved_sub is None: active_sub.pop(stmt.axis, None)
+                else: active_sub[stmt.axis] = saved_sub
             elif isinstance(stmt, Store):
                 ts, g = shapes[id(stmt.src)], tensors[stmt.dest]
-                idx = _resolve_index(stmt.index, ts, g, scope, f"store {stmt.dest}")
+                idx = _resolve_index(stmt.index, ts, g, scope, f"store {stmt.dest}", coords)
                 out.append(f"{ind}ct.store({stmt.dest}, {_tup(idx)}, {names[id(stmt.src)]})")
         return out
 
@@ -568,22 +649,33 @@ def _emit_kernel(loop: ParallelLoop, tensors: dict[str, Shape],
     body += emit_stmts(loop.body, "    ")
 
     # params: extents (sorted), then output tiles (output-dim order), then
-    # reduction tiles (encounter order). Matches kernel signatures like
-    #   (x, y, a, K, TS_n, TS_m, TS_k)
+    # reduction tiles, then spatial subtiles (encounter order). Matches kernel
+    # signatures like (x, y, a, K, TS_n, TS_m, TS_k) / (a, o, TS_n, TS_m, SUB_TS_n).
     tile_order = [f"TS_{v}" for v in loop.index_vars if f"TS_{v}" in tiles]
     const_params = ([(k, extents[k]) for k in sorted(extents)]
                     + [(k, tiles[k]) for k in tile_order]
-                    + [(k, tiles[k]) for k in red_tiles])
+                    + [(k, tiles[k]) for k in red_tiles]
+                    + [(k, tiles[k]) for k in sub_tiles])
     return name, targs, const_params, body
 
 
 def _iter_computes(stmts):
-    """Yield every Compute, descending into ReductionLoop bodies."""
+    """Yield every Compute, descending into ReductionLoop and SpatialLoop bodies."""
     for s in stmts:
         if isinstance(s, Compute):
             yield s
-        elif isinstance(s, ReductionLoop):
+        elif isinstance(s, (ReductionLoop, SpatialLoop)):
             yield from _iter_computes(s.body)
+
+
+def _iter_spatial(stmts):
+    """Yield every SpatialLoop, descending into nested loop bodies."""
+    for s in stmts:
+        if isinstance(s, SpatialLoop):
+            yield s
+            yield from _iter_spatial(s.body)
+        elif isinstance(s, ReductionLoop):
+            yield from _iter_spatial(s.body)
 
 
 def program_flops(program: Program, shapes: dict[int, Shape] | None = None):
@@ -623,6 +715,8 @@ def emit_module(program: Program, fn_name: str = "fn") -> str:
         red = next((s for s in loop.body if isinstance(s, ReductionLoop)), None)
         if red is not None:
             L.append(f"RTILE_{loop.out} = {red.tile}   # reduction tile along {red.axis}")
+        for sp in _iter_spatial(loop.body):
+            L.append(f"STILE_{loop.out}_{sp.axis} = {sp.tile}   # subtile along {sp.axis}")
     L.append("")
 
     launches = []
@@ -640,7 +734,9 @@ def emit_module(program: Program, fn_name: str = "fn") -> str:
             grid_parts = [" * ".join(cdivs[:-2]), cdivs[-2], cdivs[-1]]
         vals = []
         for p, v in const_params:
-            if p.startswith("TS_"):
+            if p.startswith("SUB_TS_"):                        # spatial subtile
+                vals.append(f"STILE_{loop.out}_{p[len('SUB_TS_'):]}")
+            elif p.startswith("TS_"):
                 axis = p[3:]
                 if axis in loop.index_vars:                    # output tile dim
                     vals.append(f"TILE_{loop.out}[{list(loop.index_vars).index(axis)}]")
