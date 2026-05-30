@@ -35,7 +35,7 @@ from typing import Callable
 
 import numpy as np
 
-from AST import (
+from kernel_ast import (
     Program, ParallelLoop, Load, Store, Compute, ReductionLoop, SpatialLoop,
     emit_module, validate, CuTileRenderer, RenderCache, program_flops, structural_key,
 )
@@ -455,6 +455,129 @@ def property_checks():
     return results
 
 
+def _all_loads(prog):
+    out = []
+    def w(b):
+        for s in b:
+            if isinstance(s, Load): out.append(s)
+            if isinstance(s, (ReductionLoop, SpatialLoop)): w(s.body)
+    for l in prog.body: w(l.body)
+    return out
+
+
+def rewrite_checks(cp, is_gpu, refmath):
+    """Hoist/Sink correctness: the rewritten kernel must compute the same result
+    as the original (the load-inside <-> load-outside equivalence), the rewrite
+    must not mutate the input tree, and preconditions must gate illegal moves."""
+    from rewrites import hoist, sink, clone_program, can_hoist, can_sink
+    results = []
+
+    def numeric(prog):
+        src = emit_module(prog)
+        ns = _exec_module(src)
+        fn, meta = ns["fn"], ns["KERNEL_META"]
+        rng = np.random.default_rng(0)
+        ins = {n: rng.standard_normal(tuple(s)).astype(np.float32) for n, s in meta["inputs"]}
+        to = (lambda a: cp.asarray(a)) if is_gpu else (lambda a: a)
+        out = fn(*[to(ins[n]) for n, _ in meta["inputs"]])
+        return np.asarray(cp.asnumpy(out) if is_gpu else out, dtype=np.float32), src
+
+    # matmul with loads inside the reduction
+    def build():
+        x, y = Load("x", ["n", "k"]), Load("y", ["k", "m"])
+        mm = Compute("matmul", [x, y])
+        red = ReductionLoop("k", 32, [x, y, mm], mm)
+        pl = ParallelLoop("c", (64, 64), ("n", "m"), [red, Store("c", red, ["n", "m"])])
+        return Program({"x": (256, 128), "y": (128, 256), "c": (256, 256)}, [pl])
+
+    base = build()
+    r_inside, _ = numeric(base)
+
+    # hoist both loads out; result must use ct.extract and match
+    x0 = _all_loads(base)
+    p = base
+    for src_name in ("x", "y"):
+        ld = [l for l in _all_loads(p) if l.source == src_name][0]
+        p = hoist(p, ld)
+    r_out, src_out = numeric(p)
+    ok = np.allclose(r_inside, r_out, rtol=1e-3, atol=1e-3) and "ct.extract" in src_out
+    results.append(("hoist_equiv", ok,
+                    f"max|d|={float(np.max(np.abs(r_inside - r_out))):.1e}, extract={'ct.extract' in src_out}"))
+
+    # original tree untouched by the rewrite
+    untouched = all(isinstance(s, (ReductionLoop, Store)) for s in base.body[0].body) \
+        and any(isinstance(s, ReductionLoop) and
+                any(isinstance(b, Load) for b in s.body) for s in base.body[0].body)
+    results.append(("rewrite_no_mutation", untouched,
+                    "input tree still has loads inside its reduction"))
+
+    # sink both back in; extract must disappear and result match
+    red = [s for s in p.body[0].body if isinstance(s, ReductionLoop)][0]
+    for src_name in ("x", "y"):
+        ld = [l for l in _all_loads(p) if l.source == src_name][0]
+        red = [s for s in p.body[0].body if isinstance(s, ReductionLoop)][0]
+        p = sink(p, ld, red)
+    r_back, src_back = numeric(p)
+    ok = np.allclose(r_inside, r_back, rtol=1e-3, atol=1e-3) and "ct.extract" not in src_back
+    results.append(("sink_roundtrip", ok,
+                    f"max|d|={float(np.max(np.abs(r_inside - r_back))):.1e}, extract={'ct.extract' in src_back}"))
+
+    # preconditions
+    top = build()
+    tx = [l for l in _all_loads(top) if l.source == "x"][0]   # at ParallelLoop top
+    # put a load at the top first by hoisting, then assert it can't hoist again
+    hp = top
+    ld = [l for l in _all_loads(hp) if l.source == "x"][0]
+    hp = hoist(hp, ld)
+    topld = [l for l in _all_loads(hp) if l.source == "x"][0]
+    reject_hoist = not can_hoist(hp, topld)[0]
+    results.append(("hoist_precondition", reject_hoist, "top-level load not hoistable"))
+
+    a = Load("a", ["n", "m"]); c = Compute("relu", [a])       # consumer OUTSIDE loop
+    sp = SpatialLoop("n", 32, [Store("o", c, ["n", "m"])])
+    bad = Program({"a": (256, 256), "o": (256, 256)},
+                  [ParallelLoop("o", (64, 64), ("n", "m"), [a, c, sp])])
+    reject_sink = not can_sink(bad, a, sp)[0]
+    results.append(("sink_precondition", reject_sink, "outside-consumer sink rejected"))
+
+    # --- SubtileReduction: full-K matmul -> tiled reduction, same result ---
+    from rewrites import subtile_reduction, can_subtile_reduction
+
+    def build_fullk():
+        x, y = Load("x", ["n", "k"]), Load("y", ["k", "m"])
+        mm = Compute("matmul", [x, y])
+        pl = ParallelLoop("c", (64, 64), ("n", "m"),
+                          [x, y, mm, Store("c", mm, ["n", "m"])])
+        return Program({"x": (256, 128), "y": (128, 256), "c": (256, 256)}, [pl]), mm
+
+    full, mm = build_fullk()
+    r_full, src_full = numeric(full)
+    p = subtile_reduction(full, mm, "k", tile=32)
+    r_red, src_red = numeric(p)
+    ok = (np.allclose(r_full, r_red, rtol=1e-3, atol=1e-3)
+          and "ct.mma" in src_red and "ct.mma" not in src_full)
+    results.append(("subtile_reduction_equiv", ok,
+                    f"max|d|={float(np.max(np.abs(r_full - r_red))):.1e}, mma={'ct.mma' in src_red}"))
+
+    # original untouched: mm still bare (not wrapped) in the input tree
+    untouched = any(s is mm for s in full.body[0].body)
+    results.append(("subtile_no_mutation", untouched, "input tree's compute still bare"))
+
+    # preconditions: reject non-contraction axis, non-reducible op, re-reduction
+    bad_axis = not can_subtile_reduction(full, mm, "n")[0]            # n is output axis
+    a2 = Load("a", ["n", "m"]); r2 = Compute("relu", [a2])
+    nonred = Program({"a": (256, 256), "o": (256, 256)},
+                     [ParallelLoop("o", (64, 64), ("n", "m"),
+                                   [a2, r2, Store("o", r2, ["n", "m"])])])
+    bad_op = not can_subtile_reduction(nonred, r2, "n")[0]
+    red_loop = next((s for s in p.body[0].body if isinstance(s, ReductionLoop)), None)
+    already = (red_loop is not None
+               and not can_subtile_reduction(p, red_loop.partial, "k")[0])
+    results.append(("subtile_precondition", bad_axis and bad_op and already,
+                    "rejects output-axis, non-reducible, and re-reduction"))
+    return results
+
+
 # ==========================================================================
 # Runner
 # ==========================================================================
@@ -498,6 +621,11 @@ def main():
             passed += 1 if ok else 0
             failed += 0 if ok else 1
         for name, ok, msg in property_checks():
+            mark = "PASS" if ok else "FAIL"
+            print(f"  [{mark}] {name:<22} {msg}")
+            passed += 1 if ok else 0
+            failed += 0 if ok else 1
+        for name, ok, msg in rewrite_checks(cp, is_gpu, refmath):
             mark = "PASS" if ok else "FAIL"
             print(f"  [{mark}] {name:<22} {msg}")
             passed += 1 if ok else 0
