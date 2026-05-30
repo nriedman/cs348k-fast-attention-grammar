@@ -575,6 +575,26 @@ def rewrite_checks(cp, is_gpu, refmath):
                and not can_subtile_reduction(p, red_loop.partial, "k")[0])
     results.append(("subtile_precondition", bad_axis and bad_op and already,
                     "rejects output-axis, non-reducible, and re-reduction"))
+
+    # --- UnwrapReduction: exact inverse of SubtileReduction ---
+    from rewrites import unwrap_reduction, can_unwrap_reduction, sink as _sink
+
+    full2, mm2 = build_fullk()
+    src_before = emit_module(full2)
+    wrapped = subtile_reduction(full2, mm2, "k", tile=32)
+    rl = next(s for s in wrapped.body[0].body if isinstance(s, ReductionLoop))
+    unwrapped = unwrap_reduction(wrapped, rl)
+    src_after = emit_module(unwrapped)
+    results.append(("unwrap_inverse", src_before == src_after,
+                    "subtile->unwrap reproduces the original source"))
+
+    # strict precondition: a reduction body with a sunk-in load is rejected
+    rl2 = next(s for s in wrapped.body[0].body if isinstance(s, ReductionLoop))
+    lx = [s for s in wrapped.body[0].body if isinstance(s, Load) and s.source == "x"][0]
+    wrapped2 = _sink(wrapped, lx, rl2)
+    rl3 = next(s for s in wrapped2.body[0].body if isinstance(s, ReductionLoop))
+    reject = not can_unwrap_reduction(wrapped2, rl3)[0]
+    results.append(("unwrap_precondition", reject, "non-bare reduction body rejected"))
     return results
 
 
