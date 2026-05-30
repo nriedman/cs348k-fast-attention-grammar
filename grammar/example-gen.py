@@ -1,4 +1,4 @@
-from AST import (Program, ParallelLoop, Load, Store, Compute,
+from kernel_ast import (Program, ParallelLoop, Load, Store, Compute,
                         SpatialLoop, emit_module)
 
 # o = relu(a), subtiling the n output dim by SUB_TS_n = 32 (block tile TS_n = 64).

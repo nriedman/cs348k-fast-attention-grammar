@@ -305,3 +305,56 @@ def subtile_reduction(program: Program, compute: Compute, axis: str,
                 c.partial = red
     _strip_clone_meta(new)
     return new
+
+
+# --------------------------------------------------------------------------
+# UnwrapReduction: the exact inverse of SubtileReduction. Collapse a
+# ReductionLoop whose body is exactly its bare Compute back into that Compute
+# (full-extent, no accumulator), and repoint every consumer of the loop's
+# accumulator value to the Compute. Load placement is untouched -- whatever
+# Hoist/Sink left the feeders as, the now-unwrapped Compute consumes them.
+# --------------------------------------------------------------------------
+def can_unwrap_reduction(program: Program, loop: ReductionLoop) -> tuple[bool, str]:
+    """Legal iff `loop` is a ReductionLoop whose body is exactly `[partial]` --
+    a single Compute, which is the partial. (Strict on purpose: this is the
+    precise post-state of SubtileReduction, so the two are clean inverses. A
+    body with sunk-in loads is rejected; Hoist them out first.)"""
+    if not isinstance(loop, ReductionLoop):
+        return False, "target is not a ReductionLoop"
+    if _scope_of(program, loop) is None:
+        return False, "loop not found in program"
+    if len(loop.body) != 1 or loop.body[0] is not loop.partial:
+        return False, ("reduction body is not exactly its bare Compute "
+                       "(hoist any loads/other statements out first)")
+    if not isinstance(loop.partial, Compute):
+        return False, "reduction partial is not a Compute"
+    return True, ""
+
+
+def unwrap_reduction(program: Program, loop: ReductionLoop) -> Program:
+    """Return a new program with `loop` replaced by its bare Compute, and every
+    consumer of the loop's accumulator repointed to that Compute."""
+    ok, why = can_unwrap_reduction(program, loop)
+    if not ok:
+        raise ValueError(f"cannot unwrap_reduction: {why}")
+    new = clone_program(program)
+    cloop = new._clone_map[id(loop)]
+    ccomp = cloop.partial
+    scope = _scope_of(new, cloop)
+    body = scope[-1].body                       # body that directly holds cloop
+
+    # replace the loop with its Compute in the same slot
+    body[body.index(cloop)] = ccomp
+
+    # every consumer that referenced the ReductionLoop now references the Compute
+    for c in _consumers(new, cloop):
+        if isinstance(c, Compute):
+            c.inputs = [ccomp if i is cloop else i for i in c.inputs]
+        elif isinstance(c, Store):
+            if c.src is cloop:
+                c.src = ccomp
+        elif isinstance(c, ReductionLoop):
+            if c.partial is cloop:
+                c.partial = ccomp
+    _strip_clone_meta(new)
+    return new
