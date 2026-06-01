@@ -41,7 +41,7 @@ def clone_program(program: Program) -> Program:
             # inputs are remapped after all producers in scope are cloned; we
             # clone the node now and fill inputs via the map (producers always
             # appear as body statements, so they are cloned by the body walk).
-            c = Compute(s.op, [])
+            c = Compute(s.op, [], axis=s.axis)
             c._orig_inputs = s.inputs            # stash; rewired in second pass
         elif isinstance(s, Store):
             c = Store(s.dest, None, list(s.index))
@@ -240,7 +240,13 @@ def _output_axes(c: Compute) -> list[str]:
 
 
 def _contraction_axes(c: Compute) -> set[str]:
-    """Axes present in the inputs but reduced away (not in the output)."""
+    """Axes present in the inputs but reduced away (not spanned by the output).
+    For matmul this is the shared input axis; for a row-reduction (rowmax/rowsum)
+    the op already names its reduced axis, and that axis is still subtileable
+    even though it remains (as size 1) in the output's axis list."""
+    from kernel_ast import ROW_REDUCE_OPS
+    if c.op in ROW_REDUCE_OPS:
+        return {c.axis}
     ins = set()
     for ld in _loads_feeding(c):
         ins.update(ld.index)

@@ -52,8 +52,12 @@ class Load(Stmt, Value):
 
 @dataclass
 class Compute(Stmt, Value):
-    op: str                        # "matmul", "add", "relu", ...
+    op: str                        # "matmul", "add", "relu", "rowmax", ...
     inputs: list[Value] = field(default_factory=list)
+    axis: str = None               # for unary reductions (rowmax/rowsum): the
+                                   # input axis collapsed away. None otherwise --
+                                   # matmul's reduced axis is inferred from its
+                                   # two inputs' shared index; elementwise has none.
 
 
 @dataclass
@@ -81,19 +85,18 @@ class ReductionLoop(Stmt, Value):
 
 @dataclass
 class SpatialLoop(Stmt):
-    """A sequential loop that subdivides ONE output tile dimension further.
-
-    `axis` is one of the enclosing ParallelLoop's index_vars (already grid-
-    tiled at TS_<axis>); the loop walks that block's tile in `tile`-sized
-    (SUB_TS_<axis>) disjoint subtiles, computing one per iteration. The grid is
-    unchanged. Unlike ReductionLoop it is NOT a Value: it has no accumulator
-    and produces nothing -- each iteration independently stores its subtile.
-    Inside the body, `axis` resolves to a composed coordinate
-        s<axis> = <axis> * (TS_<axis> // SUB_TS_<axis>) + st_<axis>
-    and its active extent narrows from TS_<axis> to SUB_TS_<axis>."""
-    axis: str                      # output index_var being subtiled, e.g. "n"
-    tile: int                      # subtile size along `axis` (SUB_TS_<axis>, tunable)
+    """REMOVED from the active grammar. Spatial (output-axis) subtiling is a
+    tile-size choice (ParallelLoop.tile_shape + a finer grid), not a structural
+    node -- it was only non-redundant for flash-style intra-block reuse, which
+    is out of scope. The class is retained as a stub so any stale reference
+    fails loudly rather than silently; nothing in the renderer handles it."""
+    axis: str
+    tile: int
     body: list[Stmt] = field(default_factory=list)
+    def __post_init__(self):
+        raise NotImplementedError(
+            "SpatialLoop has been removed from the grammar; output-axis "
+            "subtiling is expressed via ParallelLoop.tile_shape instead.")
 
 
 # --------------------------------------------------------------------------
@@ -119,13 +122,30 @@ def _matmul(out_shape: Shape, operand_globals: list[Shape | None],
     return [(m, k), (k, n)]
 
 
+def _row_reduce(out_shape: Shape, operand_globals: list[Shape | None],
+                reduce_tile: int | None = None, *, axis_pos: int = None,
+                axis_extent: int = None) -> list[Shape]:
+    # rowmax / rowsum: out has a 1 on the reduced axis; the single input restores
+    # that axis to its full extent (or TS_<axis> inside a ReductionLoop).
+    full = reduce_tile if reduce_tile is not None else axis_extent
+    in_shape = tuple(full if d == axis_pos else s for d, s in enumerate(out_shape))
+    return [in_shape]
+
+
 SHAPE_RULES = {
     "matmul": _matmul,
     "add": _elementwise,
     "mul": _elementwise,
+    "sub": _elementwise,
+    "div": _elementwise,
     "relu": _elementwise,
     "exp": _elementwise,
+    "rowmax": _row_reduce,
+    "rowsum": _row_reduce,
 }
+
+# ops whose output collapses one input axis to size 1 (a per-row reduction).
+ROW_REDUCE_OPS = {"rowmax", "rowsum"}
 
 
 # --------------------------------------------------------------------------
@@ -139,9 +159,18 @@ EMIT_RULES = {
     # all confirmed against cuTile 1.3.0
     "matmul": lambda a: f"ct.matmul({a[0]}, {a[1]})",
     "add":    lambda a: f"ct.add({a[0]}, {a[1]})",
+    "sub":    lambda a: f"({a[0]} - {a[1]})",
+    "div":    lambda a: f"({a[0]} / {a[1]})",
     "relu":   lambda a: f"ct.maximum(0, {a[0]})",
     "mul":    lambda a: f"{a[0]} * {a[1]}",
     "exp":    lambda a: f"ct.exp({a[0]})",
+}
+
+# row-reduction emission needs the collapsed-axis position; keyed separately so
+# the rest of EMIT_RULES keeps the simple arg-only signature.
+ROW_EMIT_RULES = {
+    "rowmax": lambda a, ax: f"ct.max({a[0]}, axis={ax}, keepdims=True)",
+    "rowsum": lambda a, ax: f"ct.sum({a[0]}, axis={ax}, keepdims=True)",
 }
 
 
@@ -159,9 +188,17 @@ REDUCE_RULES = {
         lambda shp, dtype: f"ct.zeros({shp}, dtype={dtype})",
         lambda a, acc:     f"ct.mma({a[0]}, {a[1]}, {acc})",
     ),
-    # later, e.g.:
-    # "rowmax": (lambda shp, dtype: f"ct.full({shp}, -inf, dtype={dtype})",
-    #            lambda a, acc: f"ct.maximum({acc}, ct.row_max({a[0]}))"),
+    # per-row reductions tiled over the key axis: each iteration reduces the
+    # loaded key-tile to a per-row partial, then folds it into the accumulator.
+    # The collapsed-axis position is supplied at the call site (acc is [.., 1]).
+    "rowmax": (
+        lambda shp, dtype: f"ct.full({shp}, -float('inf'), dtype={dtype})",
+        lambda a, acc, ax: f"ct.maximum({acc}, ct.max({a[0]}, axis={ax}, keepdims=True))",
+    ),
+    "rowsum": (
+        lambda shp, dtype: f"ct.zeros({shp}, dtype={dtype})",
+        lambda a, acc, ax: f"({acc} + ct.sum({a[0]}, axis={ax}, keepdims=True))",
+    ),
 }
 
 
@@ -226,7 +263,20 @@ class CuTileRenderer:
                 tensors.get(i.source) if isinstance(i, Load) else None
                 for i in value.inputs
             ]
-            in_shapes = SHAPE_RULES[value.op](out_shape, operand_globals, reduce_tile)
+            if value.op in ROW_REDUCE_OPS:
+                # unary per-row reduction: out has a 1 on `value.axis`; the input
+                # restores that axis to full extent (or TS_<axis> if reducing).
+                out_axes = _value_axes(value)
+                axis_pos = out_axes.index(value.axis)
+                axis_extent = _axis_global_extent(value, value.axis, tensors)
+                in_shapes = _row_reduce(out_shape, operand_globals, reduce_tile,
+                                        axis_pos=axis_pos, axis_extent=axis_extent)
+            else:
+                in_shapes = SHAPE_RULES[value.op](out_shape, operand_globals, reduce_tile)
+                # broadcasting: an input that is itself a row-reduction (or whose
+                # axes collapse a dim the output spans) keeps its 1 on that dim.
+                in_shapes = [_broadcast_in(value, inp, shp, out_shape)
+                             for inp, shp in zip(value.inputs, in_shapes)]
             for inp, shp in zip(value.inputs, in_shapes):
                 self._infer(inp, shp, tensors)
         # Load: nothing further -- its tile shape is now fixed.
@@ -673,11 +723,20 @@ def _emit_kernel(loop: ParallelLoop, tensors: dict[str, Shape],
                             f"op {stmt.op!r} cannot be a reduction partial; "
                             f"reducible: {sorted(REDUCE_RULES)}")
                     names[id(stmt)] = acc                # whole-tile rebind (immutable)
-                    out.append(f"{ind}{acc} = {REDUCE_RULES[stmt.op][1](args, acc)}")
+                    acc_fn = REDUCE_RULES[stmt.op][1]
+                    if stmt.op in ROW_REDUCE_OPS:
+                        ax = _value_axes(stmt).index(stmt.axis)
+                        out.append(f"{ind}{acc} = {acc_fn(args, acc, ax)}")
+                    else:
+                        out.append(f"{ind}{acc} = {acc_fn(args, acc)}")
                 else:
                     v = fresh(); names[id(stmt)] = v
                     mat_frames[id(stmt)] = snapshot()
-                    out.append(f"{ind}{v} = {EMIT_RULES[stmt.op](args)}")
+                    if stmt.op in ROW_REDUCE_OPS:
+                        ax = _value_axes(stmt).index(stmt.axis)
+                        out.append(f"{ind}{v} = {ROW_EMIT_RULES[stmt.op](args, ax)}")
+                    else:
+                        out.append(f"{ind}{v} = {EMIT_RULES[stmt.op](args)}")
             elif isinstance(stmt, ReductionLoop):
                 # accumulator: full output tile at THIS scope (narrowed by any
                 # SpatialLoop enclosing the reduction). No SpatialLoop may live
@@ -686,8 +745,12 @@ def _emit_kernel(loop: ParallelLoop, tensors: dict[str, Shape],
                 acc = fresh("acc")
                 acc_shape = []
                 for d, vv in enumerate(loop.index_vars):
-                    s = active_sub.get(vv, f"TS_{vv}")
-                    tiles[s] = shapes[id(stmt)][d]; acc_shape.append(s)
+                    dim = shapes[id(stmt)][d]
+                    if dim == 1:                     # collapsed axis (row-reduction)
+                        acc_shape.append("1")
+                    else:
+                        s = active_sub.get(vv, f"TS_{vv}")
+                        tiles[s] = dim; acc_shape.append(s)
                 init_fn = REDUCE_RULES[stmt.partial.op][0]
                 out.append(f"{ind}{acc} = {init_fn(_tup(acc_shape), f'{loop.out}.dtype')}")
                 k_sym, k_val = reduction_extent(stmt)
@@ -741,14 +804,18 @@ def _emit_kernel(loop: ParallelLoop, tensors: dict[str, Shape],
     body += emit_stmts(loop.body, "    ")
 
     # params: extents (sorted), then output tiles (output-dim order), then
-    # reduction tiles, then spatial subtiles (encounter order). Matches kernel
-    # signatures like (x, y, a, K, TS_n, TS_m, TS_k) / (a, o, TS_n, TS_m, SUB_TS_n).
+    # reduction tiles, then spatial subtiles (encounter order). Dedup by name so
+    # an axis that is both an output dim and a reduction axis (a row-reduction's
+    # collapsed axis) contributes a single TS_ param.
     tile_order = [f"TS_{v}" for v in loop.index_vars if f"TS_{v}" in tiles]
+    seen = set()
+    ordered = []
+    for k in tile_order + red_tiles + sub_tiles:
+        if k not in seen:
+            seen.add(k); ordered.append(k)
     const_params = ([(k, extents[k]) for k in sorted(extents)]
-                    + [(k, tiles[k]) for k in tile_order]
-                    + [(k, tiles[k]) for k in red_tiles]
-                    + [(k, tiles[k]) for k in sub_tiles])
-    return name, targs, const_params, body
+                    + [(k, tiles[k]) for k in ordered])
+    return name, targs, const_params, body, set(red_tiles)
 
 
 def _iter_computes(stmts):
@@ -770,6 +837,31 @@ def _iter_spatial(stmts):
             yield from _iter_spatial(s.body)
 
 
+def _axis_global_extent(v: Value, axis: str, tensors: dict) -> int:
+    """Full (global) extent of `axis`, found from a Load feeding `v` that
+    indexes it."""
+    for ld in _loads_feeding(v):
+        if axis in ld.index:
+            return tensors[ld.source][ld.index.index(axis)]
+    raise ValueError(f"axis {axis!r} not found in any load feeding {v!r}")
+
+
+def _broadcast_in(compute: Compute, inp: Value, shp: Shape, out_shape: Shape) -> Shape:
+    """For an elementwise op, narrow `shp` to a 1 on any dim where `inp` is a
+    per-row reduction (its output collapses that axis). The operand then
+    broadcasts against the full output tile at emission."""
+    if isinstance(inp, Compute) and inp.op in ROW_REDUCE_OPS:
+        in_axes = _value_axes(inp)
+        pos = in_axes.index(inp.axis)
+        return tuple(1 if d == pos else s for d, s in enumerate(shp))
+    if isinstance(inp, ReductionLoop) and isinstance(inp.partial, Compute) \
+            and inp.partial.op in ROW_REDUCE_OPS:
+        in_axes = _value_axes(inp)
+        pos = in_axes.index(inp.partial.axis)
+        return tuple(1 if d == pos else s for d, s in enumerate(shp))
+    return shp
+
+
 def _value_axes(v: Value) -> list[str]:
     """Logical axes a value spans, derived forward. Load: its index. Compute:
     elementwise keeps input axes; matmul drops the shared (contraction) axis.
@@ -784,7 +876,11 @@ def _value_axes(v: Value) -> list[str]:
             a0, a1 = ins
             shared = set(a0) & set(a1)
             return [x for x in a0 if x not in shared] + [x for x in a1 if x not in shared]
-        return ins[0]                       # elementwise: same axes as inputs
+        if v.op in ROW_REDUCE_OPS:
+            return list(ins[0])             # same axes; the reduced one is now size 1
+        # elementwise: the broadest operand's axes (handles broadcast operands,
+        # whose collapsed dim is size 1 but still named).
+        return max(ins, key=len)
     raise TypeError(f"no axes for {type(v).__name__}")
 
 
@@ -904,7 +1000,7 @@ def emit_module(program: Program, fn_name: str = "fn") -> str:
 
     launches = []
     for loop in program.body:
-        name, targs, const_params, body = _emit_kernel(loop, program.tensors, shapes)
+        name, targs, const_params, body, red_set = _emit_kernel(loop, program.tensors, shapes)
         sig = ", ".join(targs + [f"{p}: ConstInt" for p, _ in const_params])
         L += ["@ct.kernel", f"def {name}({sig}):"] + body + [""]
 
@@ -919,12 +1015,12 @@ def emit_module(program: Program, fn_name: str = "fn") -> str:
         for p, v in const_params:
             if p.startswith("SUB_TS_"):                        # spatial subtile
                 vals.append(f"STILE_{loop.out}_{p[len('SUB_TS_'):]}")
+            elif p in red_set:                                 # reduction tile
+                vals.append(f"RTILE_{loop.out}")
             elif p.startswith("TS_"):
                 axis = p[3:]
-                if axis in loop.index_vars:                    # output tile dim
-                    vals.append(f"TILE_{loop.out}[{list(loop.index_vars).index(axis)}]")
-                else:                                          # reduction tile
-                    vals.append(f"RTILE_{loop.out}")
+                idx = list(loop.index_vars).index(axis)        # output tile dim
+                vals.append(f"TILE_{loop.out}[{idx}]")
             else:                                              # extent (e.g. K)
                 vals.append(str(v))
         launches.append((f"({', '.join(grid_parts)})", name, _tup(targs + vals)))

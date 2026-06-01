@@ -36,7 +36,7 @@ from typing import Callable
 import numpy as np
 
 from kernel_ast import (
-    Program, ParallelLoop, Load, Store, Compute, ReductionLoop, SpatialLoop,
+    Program, ParallelLoop, Load, Store, Compute, ReductionLoop,
     emit_module, validate, CuTileRenderer, RenderCache, program_flops, structural_key,
 )
 
@@ -85,6 +85,9 @@ def _install_cpu_mock() -> None:
     ct.add = lambda a, b: a + b
     ct.maximum = lambda x, y: np.maximum(x, y)
     ct.exp = lambda x: np.exp(x)
+    ct.full = lambda shape, v, dtype=np.float32: np.full(shape, v, dtype=dtype)
+    ct.max = lambda x, axis: np.max(x, axis=axis, keepdims=True)   # row reduction
+    ct.sum = lambda x, axis: np.sum(x, axis=axis, keepdims=True)
     ct.cdiv = lambda a, b: -(-a // b)
 
     def _launch(stream, grid, kern, args):
@@ -250,7 +253,10 @@ def run_case(case: Case, cp, is_gpu: bool, refmath, verbose: bool):
 
     # reference (torch/numpy)
     ins_ref = {k: refmath.asarray(v) for k, v in inputs_np.items()}
-    expected = np.asarray(refmath.tonumpy(case.ref(refmath, ins_ref)), dtype=np.float32)
+    ref_out = case.ref(refmath, ins_ref)
+    if not isinstance(ref_out, np.ndarray):
+        ref_out = refmath.tonumpy(ref_out)
+    expected = np.asarray(ref_out, dtype=np.float32)
 
     # kernel: inputs in fn arg order, on the execution backend
     to_dev = (lambda a: cp.asarray(a)) if is_gpu else (lambda a: a)
@@ -331,45 +337,31 @@ def p_matmul_reduction():
                                  [red, Store("c", red, ["n", "m"])])])
 
 
-def p_spatial_relu():            # SpatialLoop, store INSIDE
-    a = Load("a", ["n", "m"]); r = Compute("relu", [a])
-    sp = SpatialLoop("n", 32, [a, r, Store("o", r, ["n", "m"])])
-    return Program({"a": (256, 256), "o": (256, 256)},
-                   [ParallelLoop("o", (64, 64), ("n", "m"), [sp])])
+def p_softmax():                 # row softmax over the key axis (full-row tile)
+    S = Load("S", ["n", "m"])
+    mx = Compute("rowmax", [S], axis="m")
+    sub = Compute("sub", [S, mx])
+    e = Compute("exp", [sub])
+    sm = Compute("rowsum", [e], axis="m")
+    P = Compute("div", [e, sm])
+    return Program({"S": (256, 256), "P": (256, 256)},
+                   [ParallelLoop("P", (64, 256), ("n", "m"),
+                                 [S, mx, sub, e, sm, P, Store("P", P, ["n", "m"])])])
 
 
-def p_load_outside():            # Load OUTSIDE the SpatialLoop -> sliced read
-    a = Load("a", ["n", "m"]); r = Compute("relu", [a])
-    sp = SpatialLoop("n", 32, [r, Store("o", r, ["n", "m"])])
-    return Program({"a": (256, 256), "o": (256, 256)},
-                   [ParallelLoop("o", (64, 64), ("n", "m"), [a, sp])])
-
-
-def p_store_outside():           # Store OUTSIDE -> ct.alloc buffer + scatter
-    a = Load("a", ["n", "m"]); r = Compute("relu", [a])
-    sp = SpatialLoop("n", 32, [a, r])
-    return Program({"a": (256, 256), "o": (256, 256)},
-                   [ParallelLoop("o", (64, 64), ("n", "m"),
-                                 [sp, Store("o", r, ["n", "m"])])])
-
-
-def p_reduction_in_spatial():    # ReductionLoop nested in SpatialLoop
-    x, y = Load("x", ["n", "k"]), Load("y", ["k", "m"])
-    mm = Compute("matmul", [x, y])
-    red = ReductionLoop("k", 32, [x, y, mm], mm)
-    sp = SpatialLoop("n", 32, [red, Store("c", red, ["n", "m"])])
-    return Program({"x": (256, 128), "y": (128, 256), "c": (256, 256)},
-                   [ParallelLoop("c", (64, 64), ("n", "m"), [sp])])
-
-
-def p_spatial_in_reduction():    # SpatialLoop nested in ReductionLoop (acc expand)
-    x, y = Load("x", ["n", "k"]), Load("y", ["k", "m"])
-    mm = Compute("matmul", [x, y])
-    sp = SpatialLoop("n", 32, [x, y, mm])
-    red = ReductionLoop("k", 32, [sp], mm)
-    return Program({"x": (256, 128), "y": (128, 256), "c": (256, 256)},
-                   [ParallelLoop("c", (64, 64), ("n", "m"),
-                                 [red, Store("c", red, ["n", "m"])])])
+def p_attention():               # standard attention: QK^T, softmax, PV
+    N, d = 128, 64
+    Q = Load("Q", ["i", "dd"]); KT = Load("KT", ["dd", "j"])
+    s = Compute("matmul", [Q, KT])
+    st1 = ParallelLoop("S", (64, N), ("i", "j"), [Q, KT, s, Store("S", s, ["i", "j"])])
+    S2 = Load("S", ["i", "j"]); mx = Compute("rowmax", [S2], axis="j")
+    sb = Compute("sub", [S2, mx]); e = Compute("exp", [sb])
+    sm = Compute("rowsum", [e], axis="j"); P = Compute("div", [e, sm])
+    st2 = ParallelLoop("P", (64, N), ("i", "j"), [S2, mx, sb, e, sm, P, Store("P", P, ["i", "j"])])
+    P3 = Load("P", ["i", "j"]); V = Load("V", ["j", "dd"]); o = Compute("matmul", [P3, V])
+    st3 = ParallelLoop("O", (64, d), ("i", "dd"), [P3, V, o, Store("O", o, ["i", "dd"])])
+    return Program({"Q": (N, d), "KT": (d, N), "V": (N, d),
+                    "S": (N, N), "P": (N, N), "O": (N, d)}, [st1, st2, st3])
 
 
 def p_fused_matmul_add():        # two stages: o = (x @ y) + b
@@ -400,6 +392,30 @@ def p_extract_matmul():          # full loads OUTSIDE reduction, ct.extract per 
                                  [x, y, red, Store("c", red, ["n", "m"])])])
 
 
+def p_store_outside():           # inner->outer flow: Store consumes a tile made
+    # INSIDE a ReductionLoop (the bare Compute) rather than the loop's value.
+    x, y = Load("x", ["n", "k"]), Load("y", ["k", "m"])
+    mm = Compute("matmul", [x, y])
+    red = ReductionLoop("k", 32, [x, y, mm], mm)
+    return Program({"x": (256, 128), "y": (128, 256), "c": (256, 256)},
+                   [ParallelLoop("c", (64, 64), ("n", "m"),
+                                 [red, Store("c", mm, ["n", "m"])])])  # consumes mm, not red
+
+
+def _np_softmax(s):
+    e = np.exp(s - s.max(axis=-1, keepdims=True))
+    return e / e.sum(axis=-1, keepdims=True)
+
+
+def _softmax_ref(M, i):
+    return _np_softmax(M.tonumpy(i["S"]))
+
+
+def _attention_ref(M, i):
+    s = M.tonumpy(i["Q"]) @ M.tonumpy(i["KT"])
+    return _np_softmax(s) @ M.tonumpy(i["V"])
+
+
 CASES = [
     Case("elementwise_add",     p_elementwise_add,     lambda M, i: M.add(i["a"], i["b"])),
     Case("relu",                p_relu,                lambda M, i: M.relu(i["a"])),
@@ -408,18 +424,16 @@ CASES = [
     Case("relu_of_sum",         p_relu_of_sum,         lambda M, i: M.relu(M.add(i["a"], i["b"]))),
     Case("matmul_full_k",       p_matmul_full_k,       lambda M, i: M.matmul(i["x"], i["y"])),
     Case("matmul_reduction",    p_matmul_reduction,    lambda M, i: M.matmul(i["x"], i["y"])),
-    Case("spatial_relu",        p_spatial_relu,        lambda M, i: M.relu(i["a"])),
-    Case("load_outside",        p_load_outside,        lambda M, i: M.relu(i["a"])),
     Case("extract_matmul",      p_extract_matmul,      lambda M, i: M.matmul(i["x"], i["y"])),
-    Case("reduction_in_spatial", p_reduction_in_spatial, lambda M, i: M.matmul(i["x"], i["y"])),
+    Case("softmax",             p_softmax,             _softmax_ref),
+    Case("attention",           p_attention,           _attention_ref),
     Case("fused_matmul_add",    p_fused_matmul_add,    lambda M, i: M.add(M.matmul(i["x"], i["y"]), i["b"])),
     Case("batched_4d_relu",     p_batched_4d_relu,     lambda M, i: M.relu(i["x"])),
 ]
 
-# Programs that MUST be rejected by validate() (inner->outer flow / forbidden nesting).
+# Programs that MUST be rejected by validate() (inner->outer flow).
 REJECT_CASES = [
-    ("store_outside",       p_store_outside),       # Store after a SpatialLoop
-    ("spatial_in_reduction", p_spatial_in_reduction),  # SpatialLoop inside ReductionLoop
+    ("store_outside", p_store_outside),       # Store consuming an inner-produced tile
 ]
 
 
@@ -460,7 +474,7 @@ def _all_loads(prog):
     def w(b):
         for s in b:
             if isinstance(s, Load): out.append(s)
-            if isinstance(s, (ReductionLoop, SpatialLoop)): w(s.body)
+            if isinstance(s, ReductionLoop): w(s.body)
     for l in prog.body: w(l.body)
     return out
 
@@ -533,11 +547,17 @@ def rewrite_checks(cp, is_gpu, refmath):
     reject_hoist = not can_hoist(hp, topld)[0]
     results.append(("hoist_precondition", reject_hoist, "top-level load not hoistable"))
 
-    a = Load("a", ["n", "m"]); c = Compute("relu", [a])       # consumer OUTSIDE loop
-    sp = SpatialLoop("n", 32, [Store("o", c, ["n", "m"])])
-    bad = Program({"a": (256, 256), "o": (256, 256)},
-                  [ParallelLoop("o", (64, 64), ("n", "m"), [a, c, sp])])
-    reject_sink = not can_sink(bad, a, sp)[0]
+    # sink rejected when a consumer of the load lives OUTSIDE the target loop.
+    # Build: load `b` consumed by a relu at the top level (a sibling of a
+    # reduction loop); sinking `b` into the loop would strand the relu.
+    bx, by = Load("x", ["n", "k"]), Load("y", ["k", "m"])
+    bmm = Compute("matmul", [bx, by])
+    bred = ReductionLoop("k", 32, [bx, by, bmm], bmm)
+    bb = Load("b", ["n", "m"]); brelu = Compute("relu", [bb])   # consumer OUTSIDE bred
+    bad = Program({"x": (256, 128), "y": (128, 256), "b": (256, 256), "c": (256, 256)},
+                  [ParallelLoop("c", (64, 64), ("n", "m"),
+                                [bb, brelu, bred, Store("c", bred, ["n", "m"])])])
+    reject_sink = not can_sink(bad, bb, bred)[0]
     results.append(("sink_precondition", reject_sink, "outside-consumer sink rejected"))
 
     # --- SubtileReduction: full-K matmul -> tiled reduction, same result ---
