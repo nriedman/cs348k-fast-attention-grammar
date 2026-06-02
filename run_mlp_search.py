@@ -34,7 +34,7 @@ from __future__ import annotations
 import argparse
 
 from grammar.kernel_ast import (
-    Program, ParallelLoop, Load, Store, Compute, emit_module,
+    Program, ParallelLoop, Load, Store, Compute, ReductionLoop, emit_module,
 )
 from grammar.optimization import autotune, Evaluator, EvalConfig, SearchConfig
 
@@ -53,6 +53,7 @@ def build_mlp_ln(B: int, Dm: int, H: int, eps: float = 1e-5,
         return (d0, d1) if tile is None else (min(tile, d0), min(tile, d1))
 
     from grammar.rewrites import subtile_reduction
+    import grammar.rewrites as R
 
     # h = X @ W1  -> [B, H], reduces dm
     X = Load("X", ["b", "dm"]); W1 = Load("W1", ["dm", "hid"])
@@ -97,19 +98,32 @@ def build_mlp_ln(B: int, Dm: int, H: int, eps: float = 1e-5,
 
     if subtile_k is not None:
         # wrap each matmul's contraction in a reduction loop so it emits as a
-        # ct.mma K-loop (fast to compile) instead of a full-K single ct.matmul.
+        # ct.mma K-loop (not a full-K single ct.matmul), THEN sink the operand
+        # loads into the loop. Sinking is essential: without it the loads stay
+        # hoisted and materialize a full-contraction-width tile (e.g. 64x1024),
+        # which exhausts memory during cuTile/ptxas compilation. Sunk, each
+        # iteration loads only a TS x TS slice.
         prog = subtile_reduction(prog, h, "dm", tile=min(subtile_k, Dm))
-        # after the rewrite the tree is cloned; the y-matmul is the bare matmul
-        # Compute that is NOT yet inside a ReductionLoop. Find it and subtile it.
         def bare_matmuls(p):
-            found = []
-            for loop in p.body:
-                for s in loop.body:            # top-level only; subtiled ones are nested
-                    if isinstance(s, Compute) and s.op == "matmul":
-                        found.append(s)
-            return found
+            return [s for loop in p.body for s in loop.body
+                    if isinstance(s, Compute) and s.op == "matmul"]
         for mm in bare_matmuls(prog):
             prog = subtile_reduction(prog, mm, "hid", tile=min(subtile_k, H))
+        # sink every hoisted load into its sibling reduction loop
+        changed = True
+        while changed:
+            changed = False
+            for loop in prog.body:
+                redloops = [s for s in loop.body if isinstance(s, ReductionLoop)]
+                for s in list(loop.body):
+                    if isinstance(s, Load):
+                        for rl in redloops:
+                            if R.can_sink(prog, s, rl)[0]:
+                                prog = R.sink(prog, s, rl); changed = True; break
+                        if changed:
+                            break
+                if changed:
+                    break
     return prog
 
 
