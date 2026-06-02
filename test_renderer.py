@@ -377,6 +377,32 @@ def p_attention():               # standard attention: QK^T, softmax, PV
                     "S": (N, N), "P": (N, N), "O": (N, d)}, [st1, st2, st3])
 
 
+def p_attention_atomic():        # attention, softmax SPLIT into per-compute stages
+    # Unlike p_attention (softmax fused into one stage), every Compute is its own
+    # ParallelLoop. This forces the row-reduction results mx and sm to be STORED
+    # as [N,1] tensors and RELOADED for the broadcast sub/div -- pinning that a
+    # Load of a size-1 axis loads width-1 and broadcasts (not the output-tile
+    # width). This is the decomposition the attention search starts from.
+    N, d = 128, 64
+    Q = Load("Q", ["i", "dd"]); KT = Load("KT", ["dd", "j"]); S = Compute("matmul", [Q, KT])
+    s_S = ParallelLoop("S", (64, N), ("i", "j"), [Q, KT, S, Store("S", S, ["i", "j"])])
+    SsL = Load("S", ["i", "j"]); mx = Compute("rowmax", [SsL], axis="j")
+    s_mx = ParallelLoop("mx", (64, N), ("i", "j"), [SsL, mx, Store("mx", mx, ["i", "j"])])
+    S2 = Load("S", ["i", "j"]); mxL = Load("mx", ["i", "j"]); sb = Compute("sub", [S2, mxL])
+    s_sb = ParallelLoop("sb", (64, N), ("i", "j"), [S2, mxL, sb, Store("sb", sb, ["i", "j"])])
+    sbL = Load("sb", ["i", "j"]); e = Compute("exp", [sbL])
+    s_e = ParallelLoop("e", (64, N), ("i", "j"), [sbL, e, Store("e", e, ["i", "j"])])
+    eL = Load("e", ["i", "j"]); sm = Compute("rowsum", [eL], axis="j")
+    s_sm = ParallelLoop("sm", (64, N), ("i", "j"), [eL, sm, Store("sm", sm, ["i", "j"])])
+    e2 = Load("e", ["i", "j"]); smL = Load("sm", ["i", "j"]); P = Compute("div", [e2, smL])
+    s_P = ParallelLoop("P", (64, N), ("i", "j"), [e2, smL, P, Store("P", P, ["i", "j"])])
+    P3 = Load("P", ["i", "j"]); V = Load("V", ["j", "dd"]); o = Compute("matmul", [P3, V])
+    s_O = ParallelLoop("O", (64, d), ("i", "dd"), [P3, V, o, Store("O", o, ["i", "dd"])])
+    return Program({"Q": (N, d), "KT": (d, N), "V": (N, d), "S": (N, N), "mx": (N, 1),
+                    "sb": (N, N), "e": (N, N), "sm": (N, 1), "P": (N, N), "O": (N, d)},
+                   [s_S, s_mx, s_sb, s_e, s_sm, s_P, s_O])
+
+
 def p_fused_matmul_add():        # two stages: o = (x @ y) + b
     x, y = Load("x", ["n", "k"]), Load("y", ["k", "m"])
     mm = Compute("matmul", [x, y])
@@ -508,6 +534,7 @@ CASES = [
     Case("extract_matmul",      p_extract_matmul,      lambda M, i: M.matmul(i["x"], i["y"])),
     Case("softmax",             p_softmax,             _softmax_ref),
     Case("attention",           p_attention,           _attention_ref),
+    Case("attention_atomic",    p_attention_atomic,    _attention_ref),
     Case("fused_matmul_add",    p_fused_matmul_add,    lambda M, i: M.add(M.matmul(i["x"], i["y"]), i["b"])),
     Case("batched_4d_relu",     p_batched_4d_relu,     lambda M, i: M.relu(i["x"])),
     Case("tname_collision",     p_tname_collision,     lambda M, i: M.mul(M.add(i["a"], i["b"]), i["c"])),

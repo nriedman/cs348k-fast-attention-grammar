@@ -617,7 +617,13 @@ def _infer_program(program: Program) -> dict[int, Shape]:
                 full_on = rax.get(id(s), set())     # axes this load reduces over
                 shp = []
                 for d, a in enumerate(s.index):
-                    if a in full_on:                   # feeds a row-reduction over `a`:
+                    if g[d] == 1:                      # tensor is size-1 on this axis:
+                        shp.append(1)                  # load width-1 and BROADCAST. A
+                                                       # stored row-reduction result
+                                                       # ([N,1]) reloaded for a broadcast
+                                                       # sub/div must load its 1-wide axis
+                                                       # as 1, not the output-tile width.
+                    elif a in full_on:                 # feeds a row-reduction over `a`:
                         shp.append(g[d])               # keep the FULL reduced extent
                     elif a in loop.index_vars:         # output axis: TS, or SUB if inside
                         base = loop.tile_shape[loop.index_vars.index(a)]
@@ -721,7 +727,11 @@ def _emit_kernel(loop: ParallelLoop, tensors: dict[str, Shape],
     def sym_shape(index, tile_shape, global_shape) -> list[str]:
         out = []
         for nm, t, g in zip(index, tile_shape, global_shape):
-            if t < g:
+            if g == 1:                        # size-1 (broadcast) axis: literal 1.
+                out.append("1")               # a stored [N,1] reduction result loaded
+                                              # for broadcast -- never a shared extent
+                                              # symbol (which other tensors set to N).
+            elif t < g:
                 s = active_sub.get(nm, f"TS_{nm}"); tiles[s] = t
                 out.append(s)
             else:
@@ -1008,6 +1018,28 @@ def peak_tile_bytes(program: Program, shapes: dict[int, Shape] | None = None,
             if shp is not None:
                 peak = max(peak, math.prod(shp) * dtype_bytes)
     return peak
+
+
+def kernel_peak_tile_bytes(program: Program, shapes: dict[int, Shape] | None = None,
+                           dtype_bytes: int = 4) -> list[int]:
+    """Largest single per-block tile in EACH kernel, in bytes (one entry per
+    stage, in order). `peak_tile_bytes` is the max of this list -- the hardware
+    feasibility bound. This per-kernel breakdown is what lets the search penalise
+    by the SUM of per-stage over-budget excess: with a single max-based penalty,
+    two equally-oversized stages deadlock coordinate descent (shrinking either
+    alone doesn't change the max, so neither shows gradient); summing each
+    stage's excess gives every over-budget stage its own gradient."""
+    if shapes is None:
+        shapes = _infer_program(program)
+    out = []
+    for loop in program.body:
+        big = 0
+        for n in _tile_producing_nodes(loop.body):
+            shp = shapes.get(id(n))
+            if shp is not None:
+                big = max(big, math.prod(shp) * dtype_bytes)
+        out.append(big)
+    return out
 
 
 def program_flops(program: Program, shapes: dict[int, Shape] | None = None):

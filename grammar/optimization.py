@@ -39,7 +39,8 @@ from dataclasses import dataclass, field
 
 from .kernel_ast import (
     Program, ParallelLoop, ReductionLoop, SpatialLoop, Load, Store, Compute,
-    emit_module, structural_key, peak_tile_bytes, program_flops,
+    emit_module, structural_key, peak_tile_bytes, kernel_peak_tile_bytes,
+    program_flops,
 )
 from . import rewrites as R
 
@@ -122,21 +123,28 @@ class Evaluator:
                   f"{len(program.body)} stage(s): {tiles}", flush=True)
         if self.cfg.proxy:
             return _proxy_score(program, src)
-        # Memory pre-check: a kernel whose resident tile footprint exceeds the
-        # budget will blow up the compiler (and can exhaust host RAM), so we do
-        # NOT compile it. Instead of inf -- which gives the search no direction --
-        # we return a large penalty PROPORTIONAL to the footprint, so descent
-        # still feels a gradient pulling tiles smaller until a program fits and
-        # actually compiles. The MEM_PENALTY_BASE offset keeps every penalised
-        # score far above any real runtime (ms), so a compilable program always
-        # beats an over-budget one.
+        # Memory pre-check: a kernel whose largest single per-block tile exceeds
+        # the budget can't be scheduled (SMEM) and blows up the compiler, so we do
+        # NOT compile it. The FEASIBILITY gate is max-based (the hardware limit is
+        # per-tile). But the PENALTY MAGNITUDE is the SUM of every stage's
+        # over-budget excess -- not the global max -- so each over-budget stage
+        # gets its own descent gradient. With a max-based penalty, two equally
+        # oversized stages deadlock: shrinking either alone leaves the max (and the
+        # loss) unchanged, so coordinate descent sees no improvement on either and
+        # never escapes. Summing the excess makes shrinking ANY oversized stage
+        # lower the loss. MEM_PENALTY_BASE keeps every penalised score far above
+        # any real runtime, so a compilable program always wins.
         if self.cfg.mem_budget:
-            footprint = peak_tile_bytes(program)
-            if footprint > self.cfg.mem_budget:
-                penalty = MEM_PENALTY_BASE + footprint / 1024.0   # +1 per KB
+            per_kernel = kernel_peak_tile_bytes(program)
+            gmax = max(per_kernel) if per_kernel else 0
+            if gmax > self.cfg.mem_budget:
+                excess = sum(max(0, k - self.cfg.mem_budget) for k in per_kernel)
+                penalty = MEM_PENALTY_BASE + excess / 1024.0   # +1 per KB over budget
                 if self.cfg.log:
-                    print(f"[eval] OVER BUDGET {footprint/1024:.0f}KB > "
-                          f"{self.cfg.mem_budget/1024:.0f}KB -> penalty {penalty:.0f} "
+                    n_over = sum(1 for k in per_kernel if k > self.cfg.mem_budget)
+                    print(f"[eval] OVER BUDGET max {gmax/1024:.0f}KB > "
+                          f"{self.cfg.mem_budget/1024:.0f}KB in {n_over} stage(s), "
+                          f"excess {excess/1024:.0f}KB -> penalty {penalty:.0f} "
                           f"(not compiled)", flush=True)
                 return penalty
         self._compiles += 1
@@ -506,11 +514,19 @@ def enumerate_rewrites(program: Program, rules) -> list:
 
 def stage2_step(program: Program, ev: Evaluator, K: int, rules, rng: random.Random
                 ) -> tuple[Program, float, list]:
-    """Sample K applicable rewrites, trial each (apply + one Stage-1 sweep),
-    then apply all non-worsening best-first -- re-resolving each against the
-    evolving program and skipping any whose precondition no longer holds. Because
+    """Sample K applicable rewrites, trial each (apply + one Stage-1 sweep), then
+    apply all non-worsening best-first -- re-resolving each against the evolving
+    program and skipping any whose precondition no longer holds. Because
     descriptors re-resolve (rather than replay stale-node closures), several
-    rewrites can land in one step."""
+    rewrites can land in one step.
+
+    Guard: each trial is non-worsening ALONE, but the combination can regress
+    (e.g. two rewrites that are each fine separately together push a tile back
+    over the memory budget, or one undoes the feasibility the other enabled). So
+    after building the combination we evaluate it and, if it is worse than the
+    best individual accepted trial, fall back to that single trial. This
+    guarantees stage 2's committed program is at least as good as its best trial
+    -- i.e. if ANY trial compiled, the committed program compiles."""
     base_loss = stage1_sweep(program, ev)[1]
     menu = enumerate_rewrites(program, rules)
     if not menu:
@@ -518,13 +534,16 @@ def stage2_step(program: Program, ev: Evaluator, K: int, rules, rng: random.Rand
     sample = rng.sample(menu, min(K, len(menu)))
 
     trials = []                                  # (delta, rewrite)
+    best_trial = None                            # (loss, tuned_prog, label, delta)
     for rw in sample:
         cand = rw.resolve(program)               # apply to a fresh clone
         if cand is None:
             continue
-        _, loss = stage1_sweep(cand, ev)         # judge the move WITH a re-tune
+        tuned, loss = stage1_sweep(cand, ev)     # judge the move WITH a re-tune
         if loss <= base_loss:                    # accept non-worsening (enabling moves)
             trials.append((base_loss - loss, rw))
+            if best_trial is None or loss < best_trial[0]:
+                best_trial = (loss, tuned, rw.label, base_loss - loss)
 
     trials.sort(key=lambda t: -t[0])             # best improvement first
     applied = []
@@ -535,7 +554,14 @@ def stage2_step(program: Program, ev: Evaluator, K: int, rules, rng: random.Rand
             continue                             # precondition no longer holds here
         prog = cand
         applied.append((rw.label, delta))
-    return prog, base_loss, applied
+
+    # tune the committed combination; fall back to the best single trial if the
+    # combination regressed below it (so a good single rewrite is never lost to a
+    # bad combination).
+    combo, combo_loss = stage1_sweep(prog, ev)
+    if best_trial is not None and best_trial[0] < combo_loss:
+        return best_trial[1], best_trial[0], [(best_trial[2], best_trial[3])]
+    return combo, combo_loss, applied
 
 
 # ==========================================================================
