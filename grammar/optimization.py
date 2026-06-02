@@ -32,12 +32,14 @@ import sys
 import time
 import tempfile
 import os
+import json
+import pickle
 import importlib.util
 from dataclasses import dataclass, field
 
 from .kernel_ast import (
     Program, ParallelLoop, ReductionLoop, SpatialLoop, Load, Store, Compute,
-    emit_module, structural_key, peak_tile_bytes,
+    emit_module, structural_key, peak_tile_bytes, program_flops,
 )
 from . import rewrites as R
 
@@ -537,6 +539,120 @@ def stage2_step(program: Program, ev: Evaluator, K: int, rules, rng: random.Rand
 
 
 # ==========================================================================
+# Persistence: analysis log (append-only JSONL) + resume snapshot (pickle).
+# Two artifacts with different jobs --
+#   * ANALYSIS (run_dir/log.jsonl, run_dir/kernels/best_it{N}.py): an append-only
+#     per-iteration record plus the emitted cuTile SOURCE of every new best. Source
+#     is durable -- re-benchmarkable later regardless of code changes -- so the
+#     publication graphs never depend on un-pickling a live AST.
+#   * RESUME (run_dir/snapshot.pkl): the full mutable search state (current + best
+#     program, iteration, RNG state, evaluator cache, config) pickled every
+#     iteration so an interrupted run continues deterministically. Pickle is used
+#     for fidelity; it must be unpickled with compatible code.
+# ==========================================================================
+def loss_kind(loss: float) -> str:
+    """Classify a score so analysis can separate the three regimes the search
+    moves through: a real compiled runtime, an over-memory-budget penalty, or an
+    infeasible program (illegal fusion / compile failure)."""
+    if loss == math.inf:
+        return "infeasible"
+    if loss >= MEM_PENALTY_BASE:
+        return "penalty"
+    return "feasible"
+
+
+class RunLogger:
+    """Writes the analysis log + resume snapshots for one search run."""
+
+    def __init__(self, run_dir: str, cfg, start_program: Program):
+        self.dir = run_dir
+        self.kernels_dir = os.path.join(run_dir, "kernels")
+        os.makedirs(self.kernels_dir, exist_ok=True)
+        self.log_path = os.path.join(run_dir, "log.jsonl")
+        self.snap_path = os.path.join(run_dir, "snapshot.pkl")
+        # config.json: the run settings + the starting program's source, so a
+        # later reader knows exactly what produced this run.
+        try:
+            start_src = emit_module(start_program)
+        except Exception:
+            start_src = None
+        with open(os.path.join(run_dir, "config.json"), "w") as f:
+            json.dump({
+                "search": {k: _jsonable(v) for k, v in vars(cfg).items()},
+                "start_stages": [[s.out, list(s.tile_shape)] for s in start_program.body],
+                "start_source": start_src,
+            }, f, indent=2)
+
+    # ---- analysis ----
+    def log_iter(self, *, iteration, loss, best_loss, applied, program, best_key):
+        """Append one JSONL record describing this iteration."""
+        try:
+            flops, flops_exact = program_flops(program)
+        except Exception:
+            flops, flops_exact = None, False
+        try:
+            footprint = peak_tile_bytes(program)
+        except Exception:
+            footprint = None
+        rec = {
+            "iter": iteration,
+            "loss": _num(loss),
+            "loss_kind": loss_kind(loss),
+            "best_loss": _num(best_loss),
+            "best_loss_kind": loss_kind(best_loss),
+            "applied": [a for a, _ in applied],
+            "stages": [[s.out, list(s.tile_shape)] for s in program.body],
+            "n_stages": len(program.body),
+            "flops": flops,
+            "flops_exact": flops_exact,
+            "peak_tile_bytes": footprint,
+            "best_key": best_key,
+        }
+        with open(self.log_path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    def save_best_source(self, iteration: int, best_program: Program):
+        """Write the emitted source of a new best program (durable artifact)."""
+        try:
+            src = emit_module(best_program)
+        except Exception:
+            return
+        with open(os.path.join(self.kernels_dir, f"best_it{iteration}.py"), "w") as f:
+            f.write(src)
+
+    # ---- resume ----
+    def snapshot(self, state: dict):
+        """Pickle the full search state. Write to a temp file then rename, so a
+        crash mid-write can't corrupt the existing snapshot (atomic on POSIX)."""
+        tmp = self.snap_path + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, self.snap_path)
+
+
+def load_snapshot(run_dir: str) -> dict:
+    """Load a resume snapshot from a run directory."""
+    with open(os.path.join(run_dir, "snapshot.pkl"), "rb") as f:
+        return pickle.load(f)
+
+
+def _num(x):
+    """JSON-safe number: inf -> a sentinel string (JSON has no inf)."""
+    if x == math.inf:
+        return "inf"
+    return x
+
+
+def _jsonable(v):
+    """Best-effort conversion of a config value to something JSON can hold."""
+    if isinstance(v, (str, int, float, bool)) or v is None:
+        return v
+    if isinstance(v, (tuple, list)):
+        return list(v)
+    return str(v)
+
+
+# ==========================================================================
 # Outer loop
 # ==========================================================================
 @dataclass
@@ -547,6 +663,20 @@ class SearchConfig:
     rules: tuple = DEFAULT_RULES
     seed: int = 0
     verbose: bool = True
+    run_dir: str | None = None                   # if set, write log + snapshots here
+    resume: bool = False                          # resume from run_dir/snapshot.pkl
+
+
+def _better(loss: float, best: float) -> bool:
+    """Is `loss` a better result to record as best than `best`? A feasible (real
+    ms) result always beats a penalty, which always beats infeasible; within the
+    same regime, lower is better. This fixes the bug where an early penalty score
+    (1e9) was recorded as 'best' and a later real-millisecond compile -- numerically
+    smaller, but the FIRST feasible point -- still needs to replace it. Because
+    feasible losses are < MEM_PENALTY_BASE < inf, a plain `loss < best` already
+    orders the regimes correctly; this helper makes that ordering explicit and is
+    the single place best-tracking is decided."""
+    return loss < best
 
 
 def autotune(program: Program, ev: Evaluator | None = None,
@@ -556,28 +686,83 @@ def autotune(program: Program, ev: Evaluator | None = None,
     greedy sweep that one sweep already reaches the coordinate-descent optimum,
     so N is kept small (a few extra param-only iterations between rewrites would
     just re-evaluate cached neighbors). Returns the best program seen, since the
-    descent can wander under the <=-acceptance rule."""
+    descent can wander under the <=-acceptance rule.
+
+    If cfg.run_dir is set, an analysis log (log.jsonl), best-program sources
+    (kernels/best_it{N}.py) and a resume snapshot (snapshot.pkl) are written each
+    iteration. With cfg.resume, the run continues from an existing snapshot."""
     ev = ev or Evaluator()
-    rng = random.Random(cfg.seed)
+    logger = RunLogger(cfg.run_dir, cfg, program) if cfg.run_dir else None
 
-    program, loss = stage1_sweep(program, ev)        # initial tune
-    best_prog, best_loss = R.clone_program(program), loss
-    R._strip_clone_meta(best_prog)
-    if cfg.verbose:
-        print(f"[init] loss={loss:.4g}")
+    if cfg.resume and cfg.run_dir:
+        # restore full state: programs, iteration, RNG stream, evaluator cache.
+        st = load_snapshot(cfg.run_dir)
+        program = st["program"]
+        best_prog, best_loss = st["best_prog"], st["best_loss"]
+        start_it = st["iteration"] + 1
+        rng = random.Random()
+        rng.setstate(st["rng_state"])
+        ev._cache = st.get("eval_cache", ev._cache)
+        if cfg.verbose:
+            print(f"[resume] from iter {st['iteration']} best={best_loss:.4g}")
+    else:
+        rng = random.Random(cfg.seed)
+        program, loss = stage1_sweep(program, ev)        # initial tune
+        best_prog, best_loss = R.clone_program(program), loss
+        R._strip_clone_meta(best_prog)
+        start_it = 1
+        if cfg.verbose:
+            print(f"[init] loss={loss:.4g}")
+        if logger:
+            if loss_kind(loss) == "feasible":
+                logger.save_best_source(0, best_prog)
+            logger.log_iter(iteration=0, loss=loss, best_loss=best_loss,
+                            applied=[], program=program,
+                            best_key=structural_key(best_prog))
+            logger.snapshot(_search_state(program, best_prog, best_loss, 0, rng, ev, cfg))
 
-    for it in range(1, cfg.iters + 1):
+    for it in range(start_it, cfg.iters + 1):
+        applied = []
         if it % cfg.N == 0:
             program, _, applied = stage2_step(program, ev, cfg.K, cfg.rules, rng)
             if cfg.verbose and applied:
                 print(f"[it {it}] applied {[a for a, _ in applied]}")
         program, loss = stage1_sweep(program, ev)    # tune (after rewrite, or refine)
-        if loss < best_loss:
+        # best-tracking is over the ACCEPTED path only: the program the search
+        # commits to each iteration. A program tuned inside a rejected Stage-2
+        # trial is deliberately NOT recorded -- the search walked away from it.
+        improved = _better(loss, best_loss)
+        if improved:
             best_loss, best_prog = loss, R.clone_program(program)
             R._strip_clone_meta(best_prog)
         if cfg.verbose:
             print(f"[it {it}] loss={loss:.4g}  best={best_loss:.4g}")
+        if logger:
+            # save the durable best-source whenever best improves to a FEASIBLE
+            # program (penalties/infeasible aren't worth re-benchmarking).
+            if improved and loss_kind(best_loss) == "feasible":
+                logger.save_best_source(it, best_prog)
+            logger.log_iter(iteration=it, loss=loss, best_loss=best_loss,
+                            applied=applied, program=program,
+                            best_key=structural_key(best_prog))
+            logger.snapshot(_search_state(program, best_prog, best_loss, it, rng, ev, cfg))
 
     if cfg.verbose:
         print(f"[done] best={best_loss:.4g}  compiles={ev._compiles} runs={ev._runs}")
     return best_prog
+
+
+def _search_state(program, best_prog, best_loss, iteration, rng, ev, cfg) -> dict:
+    """Bundle the full mutable search state for a resume snapshot. The evaluator
+    cache (structural_key -> ms) is included because every entry cost a real GPU
+    compile and is expensive to rebuild; the RNG state (not just the seed) is
+    included so a resumed run reproduces the exact stochastic stream."""
+    return {
+        "program": program,
+        "best_prog": best_prog,
+        "best_loss": best_loss,
+        "iteration": iteration,
+        "rng_state": rng.getstate(),
+        "eval_cache": ev._cache,
+        "config": {k: _jsonable(v) for k, v in vars(cfg).items()},
+    }
