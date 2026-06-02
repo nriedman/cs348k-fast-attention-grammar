@@ -40,14 +40,19 @@ from grammar.optimization import autotune, Evaluator, EvalConfig, SearchConfig
 
 
 def build_mlp_ln(B: int, Dm: int, H: int, eps: float = 1e-5,
-                 tile: int | None = None) -> Program:
+                 tile: int | None = None, subtile_k: int | None = None) -> Program:
     """MLP + residual + LayerNorm as separate stages. `tile` sets a uniform
     starting output-tile size (None => atomic: full-extent tiles, so the search
-    must discover tiling). Axis names: b (batch), dm (feature), hid (hidden) --
-    deliberately distinct from tensor names (h, a, y) to avoid an axis/tensor
-    name clash in the emitted index variables."""
+    must discover tiling). `subtile_k` (if set) pre-wraps each matmul in a
+    reduction loop tiling its contraction by that amount -- this makes the
+    matmuls emit as ct.mma K-loops from the start, avoiding the pathologically
+    slow cuTile compile of a full-K single-tile ct.matmul. The search can still
+    retune the K-tile and apply every other rewrite. Axis names: b (batch),
+    dm (feature), hid (hidden) -- distinct from tensor names to avoid clashes."""
     def t2(d0, d1):
         return (d0, d1) if tile is None else (min(tile, d0), min(tile, d1))
+
+    from grammar.rewrites import subtile_reduction
 
     # h = X @ W1  -> [B, H], reduces dm
     X = Load("X", ["b", "dm"]); W1 = Load("W1", ["dm", "hid"])
@@ -88,7 +93,24 @@ def build_mlp_ln(B: int, Dm: int, H: int, eps: float = 1e-5,
 
     tens = {"X": (B, Dm), "W1": (Dm, H), "W2": (H, Dm),
             "h": (B, H), "a": (B, H), "y": (B, Dm), "r": (B, Dm), "out": (B, Dm)}
-    return Program(tens, [s_h, s_a, s_y, s_r, s_ln])
+    prog = Program(tens, [s_h, s_a, s_y, s_r, s_ln])
+
+    if subtile_k is not None:
+        # wrap each matmul's contraction in a reduction loop so it emits as a
+        # ct.mma K-loop (fast to compile) instead of a full-K single ct.matmul.
+        prog = subtile_reduction(prog, h, "dm", tile=min(subtile_k, Dm))
+        # after the rewrite the tree is cloned; the y-matmul is the bare matmul
+        # Compute that is NOT yet inside a ReductionLoop. Find it and subtile it.
+        def bare_matmuls(p):
+            found = []
+            for loop in p.body:
+                for s in loop.body:            # top-level only; subtiled ones are nested
+                    if isinstance(s, Compute) and s.op == "matmul":
+                        found.append(s)
+            return found
+        for mm in bare_matmuls(prog):
+            prog = subtile_reduction(prog, mm, "hid", tile=min(subtile_k, H))
+    return prog
 
 
 def describe(program: Program) -> str:
@@ -120,24 +142,33 @@ def main():
     ap.add_argument("--h", type=int, default=1024, help="hidden dim")
     ap.add_argument("--tile", type=int, default=None,
                     help="uniform starting tile (default: atomic full-extent)")
+    ap.add_argument("--subtile-k", type=int, default=None, dest="subtile_k",
+                    help="pre-wrap matmuls in a K-loop of this tile (avoids the "
+                         "slow full-K compile; recommended for the first run)")
     ap.add_argument("--iters", type=int, default=30)
     ap.add_argument("--every", type=int, default=2, help="Stage-2 every N iters")
     ap.add_argument("--k", type=int, default=8, help="rewrites sampled per Stage-2")
-    ap.add_argument("--warmup", type=int, default=5)
-    ap.add_argument("--reps", type=int, default=20)
+    ap.add_argument("--warmup", type=int, default=1)
+    ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--proxy", action="store_true")
+    ap.add_argument("--log", action="store_true", help="per-eval phase timing")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    prog = build_mlp_ln(args.b, args.dm, args.h, tile=args.tile)
+    prog = build_mlp_ln(args.b, args.dm, args.h, tile=args.tile, subtile_k=args.subtile_k)
     ev = Evaluator(EvalConfig(warmup=args.warmup, iters=args.reps,
-                              proxy=args.proxy, seed=args.seed))
+                              proxy=args.proxy, seed=args.seed, log=args.log))
 
     print(f"task: MLP + residual + LayerNorm   X[{args.b},{args.dm}] "
           f"W1[{args.dm},{args.h}] W2[{args.h},{args.dm}]  fp32")
     print(f"start: {describe(prog)}")
+    if args.tile is None and not args.proxy:
+        print("note: atomic start -> the first eval JIT-compiles full-extent "
+              "single-tile matmuls, which can be VERY slow to compile. If the "
+              "first eval hangs, start feasible with e.g. --tile 64.", flush=True)
+    print("timing start program (compiling)...", flush=True)
     init_loss = ev(prog)
-    print(f"start loss: {init_loss:.4g}{' (proxy)' if args.proxy else ' ms'}\n")
+    print(f"start loss: {init_loss:.4g}{' (proxy)' if args.proxy else ' ms'}\n", flush=True)
 
     best = autotune(prog, ev, SearchConfig(
         iters=args.iters, N=args.every, K=args.k, seed=args.seed, verbose=True))

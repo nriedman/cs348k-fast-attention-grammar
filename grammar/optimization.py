@@ -29,6 +29,7 @@ from __future__ import annotations
 import math
 import random
 import sys
+import time
 import tempfile
 import os
 import importlib.util
@@ -52,10 +53,11 @@ TILE_LADDER = (16, 32, 64, 128)        # ORIGINAL_DIM (full extent) is added per
 
 @dataclass
 class EvalConfig:
-    warmup: int = 3
-    iters: int = 10                     # fewer than the standalone bench, for speed
+    warmup: int = 1                     # lean: JIT-compile + cache warm; min-of-reps denoises
+    iters: int = 3                      # relative ranking only needs a few timed reps
     proxy: bool = False                 # dev-only: skip GPU, use a cheap fake score
     seed: int = 0
+    log: bool = False                   # per-eval phase timing (emit / compile / run)
 
 
 class Evaluator:
@@ -77,26 +79,47 @@ class Evaluator:
         return ms
 
     def _measure(self, program: Program) -> float:
+        t0 = time.perf_counter()
         try:
             src = emit_module(program)
-        except Exception:
+        except Exception as e:
+            if self.cfg.log:
+                print(f"[eval] emit FAILED ({type(e).__name__}: {e}) -> inf", flush=True)
             return math.inf                 # invalid / unrenderable structure
+        if self.cfg.log:
+            tiles = " ".join(f"{l.out}{tuple(l.tile_shape)}" for l in program.body)
+            print(f"[eval] emit {1e3*(time.perf_counter()-t0):.0f}ms  "
+                  f"{len(program.body)} stage(s): {tiles}", flush=True)
         if self.cfg.proxy:
             return _proxy_score(program, src)
         self._compiles += 1
         try:
             return self._run_gpu(src)
-        except Exception:
+        except Exception as e:
+            if self.cfg.log:
+                print(f"[eval] run FAILED ({type(e).__name__}: {e}) -> inf", flush=True)
             return math.inf                 # compile or launch failure (e.g. SMEM)
 
     def _run_gpu(self, src: str) -> float:
         import cupy as cp
+        log = self.cfg.log
+        t0 = time.perf_counter()
         mod = _import_source(src)
         meta = mod.KERNEL_META
         rng = cp.random.RandomState(self.cfg.seed)
         args = [rng.randn(*s).astype(cp.float32) for _, s in meta["inputs"]]
         fn = mod.fn
-        for _ in range(self.cfg.warmup):
+        if log:
+            print(f"[eval]   import+alloc {1e3*(time.perf_counter()-t0):.0f}ms", flush=True)
+        # First launch triggers cuTile JIT compilation of every kernel in the
+        # module -- time it separately, since it dominates and is the usual hang.
+        t1 = time.perf_counter()
+        fn(*args)
+        cp.cuda.runtime.deviceSynchronize()
+        if log:
+            print(f"[eval]   JIT compile + first launch "
+                  f"{1e3*(time.perf_counter()-t1):.0f}ms", flush=True)
+        for _ in range(max(0, self.cfg.warmup - 1)):
             fn(*args)
         cp.cuda.runtime.deviceSynchronize()
         start = cp.cuda.Event(); end = cp.cuda.Event()
@@ -109,7 +132,10 @@ class Evaluator:
         self._runs += 1
         # minimum is the least scheduling-noise-contaminated sample for a
         # throughput-bound kernel; median still drifts with system jitter.
-        return min(times)
+        best = min(times)
+        if log:
+            print(f"[eval]   {self.cfg.iters} timed reps -> min {best:.4g}ms", flush=True)
+        return best
 
 
 _MODULE_SEQ = [0]

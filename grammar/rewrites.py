@@ -255,7 +255,7 @@ def _contraction_axes(c: Compute) -> set[str]:
     For matmul this is the shared input axis; for a row-reduction (rowmax/rowsum)
     the op already names its reduced axis, and that axis is still subtileable
     even though it remains (as size 1) in the output's axis list."""
-    from kernel_ast import ROW_REDUCE_OPS
+    from .kernel_ast import ROW_REDUCE_OPS
     if c.op in ROW_REDUCE_OPS:
         return {c.axis}
     ins = set()
