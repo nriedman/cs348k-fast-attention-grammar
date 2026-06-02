@@ -35,7 +35,7 @@ from typing import Callable
 
 import numpy as np
 
-from kernel_ast import (
+from grammar.kernel_ast import (
     Program, ParallelLoop, Load, Store, Compute, ReductionLoop,
     emit_module, validate, CuTileRenderer, RenderCache, program_flops, structural_key,
 )
@@ -85,6 +85,7 @@ def _install_cpu_mock() -> None:
     ct.add = lambda a, b: a + b
     ct.maximum = lambda x, y: np.maximum(x, y)
     ct.exp = lambda x: np.exp(x)
+    ct.sqrt = lambda x: np.sqrt(x)
     ct.full = lambda shape, v, dtype=np.float32: np.full(shape, v, dtype=dtype)
     ct.max = lambda x, axis, keepdims=False: np.max(x, axis=axis, keepdims=keepdims)
     ct.sum = lambda x, axis, keepdims=False: np.sum(x, axis=axis, keepdims=keepdims)
@@ -158,6 +159,12 @@ class _NumpyRef:
     mul = staticmethod(lambda a, b: a * b)
     relu = staticmethod(lambda a: np.maximum(a, 0.0))
     exp = staticmethod(lambda a: np.exp(a))
+    sqrt = staticmethod(lambda a: np.sqrt(a))
+    sub = staticmethod(lambda a, b: a - b)
+    div = staticmethod(lambda a, b: a / b)
+    rowsum = staticmethod(lambda a: a.sum(-1, keepdims=True))
+    mulc = staticmethod(lambda a, c: a * c)
+    addc = staticmethod(lambda a, c: a + c)
     asarray = staticmethod(lambda a: np.asarray(a))
     tonumpy = staticmethod(lambda a: np.asarray(a))
 
@@ -174,6 +181,12 @@ class _TorchRef:
     def mul(self, a, b): return a * b
     def relu(self, a): return self.t.relu(a)
     def exp(self, a): return self.t.exp(a)
+    def sqrt(self, a): return self.t.sqrt(a)
+    def sub(self, a, b): return a - b
+    def div(self, a, b): return a / b
+    def rowsum(self, a): return a.sum(-1, keepdim=True)
+    def mulc(self, a, c): return a * c
+    def addc(self, a, c): return a + c
     def asarray(self, a): return self.t.as_tensor(np.asarray(a), device=self.dev)
     def tonumpy(self, a): return a.detach().to("cpu").numpy()
 
@@ -391,6 +404,33 @@ def p_tname_collision():         # tensors named like fresh tile vars (t1, t2)
                     "t1": (256, 256), "t2": (256, 256)}, [s1, s2])
 
 
+def p_layernorm():               # sqrt + const ops + row-reduction broadcast
+    # out = (r - mean)/sqrt(var+eps), mean=sum(r)/D, var=sum(r^2)/D - mean^2.
+    D, eps = 128, 1e-5
+    rL = Load("r", ["b", "f"]); s1 = Compute("rowsum", [rL], axis="f")
+    r2a, r2b = Load("r", ["b", "f"]), Load("r", ["b", "f"])
+    rr = Compute("mul", [r2a, r2b]); s2 = Compute("rowsum", [rr], axis="f")
+    mean = Compute("mulc", [s1], const=1.0 / D)
+    meansq = Compute("mulc", [s2], const=1.0 / D)
+    mean2 = Compute("mul", [mean, mean]); var = Compute("sub", [meansq, mean2])
+    vareps = Compute("addc", [var], const=eps); std = Compute("sqrt", [vareps])
+    r3 = Load("r", ["b", "f"]); centered = Compute("sub", [r3, mean])
+    out = Compute("div", [centered, std])
+    return Program({"r": (64, D), "o": (64, D)},
+                   [ParallelLoop("o", (64, D), ("b", "f"),
+                                 [rL, s1, r2a, r2b, rr, s2, mean, meansq, mean2,
+                                  var, vareps, std, r3, centered, out,
+                                  Store("o", out, ["b", "f"])])])
+
+
+def _ref_layernorm(M, i):
+    r = i["r"]; D = 128
+    mean = M.mulc(M.rowsum(r), 1.0 / D)
+    meansq = M.mulc(M.rowsum(M.mul(r, r)), 1.0 / D)
+    var = M.sub(meansq, M.mul(mean, mean))
+    return M.div(M.sub(r, mean), M.sqrt(M.addc(var, 1e-5)))
+
+
 def p_batched_4d_relu():         # 4-D output -> grid collapse/decode
     x = Load("x", ["b0", "b1", "n", "m"]); r = Compute("relu", [x])
     return Program({"x": (2, 4, 128, 128), "y": (2, 4, 128, 128)},
@@ -448,6 +488,7 @@ CASES = [
     Case("fused_matmul_add",    p_fused_matmul_add,    lambda M, i: M.add(M.matmul(i["x"], i["y"]), i["b"])),
     Case("batched_4d_relu",     p_batched_4d_relu,     lambda M, i: M.relu(i["x"])),
     Case("tname_collision",     p_tname_collision,     lambda M, i: M.mul(M.add(i["a"], i["b"]), i["c"])),
+    Case("layernorm",           p_layernorm,           _ref_layernorm),
 ]
 
 # Programs that MUST be rejected by validate() (inner->outer flow).

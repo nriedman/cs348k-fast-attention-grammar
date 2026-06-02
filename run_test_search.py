@@ -20,10 +20,10 @@ from __future__ import annotations
 
 import argparse
 
-from kernel_ast import (
+from grammar.kernel_ast import (
     Program, ParallelLoop, Load, Store, Compute, emit_module,
 )
-from optimization import autotune, Evaluator, EvalConfig, SearchConfig
+from grammar.optimization import autotune, Evaluator, EvalConfig, SearchConfig
 
 
 def build_chain(n: int, m: int, tile: int) -> Program:

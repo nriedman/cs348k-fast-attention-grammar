@@ -34,11 +34,11 @@ import os
 import importlib.util
 from dataclasses import dataclass, field
 
-from kernel_ast import (
+from .kernel_ast import (
     Program, ParallelLoop, ReductionLoop, SpatialLoop, Load, Store, Compute,
     emit_module, structural_key,
 )
-import rewrites as R
+from . import rewrites as R
 
 
 # ==========================================================================
@@ -470,8 +470,8 @@ def stage2_step(program: Program, ev: Evaluator, K: int, rules, rng: random.Rand
 # ==========================================================================
 @dataclass
 class SearchConfig:
-    iters: int = 40
-    N: int = 4                                   # run Stage 2 every N iterations
+    iters: int = 30
+    N: int = 2                                   # run Stage 2 every N iterations
     K: int = 6                                   # rewrites sampled per Stage-2 step
     rules: tuple = DEFAULT_RULES
     seed: int = 0
@@ -480,23 +480,27 @@ class SearchConfig:
 
 def autotune(program: Program, ev: Evaluator | None = None,
              cfg: SearchConfig = SearchConfig()) -> Program:
-    """Stochastic Rewrite Descent. Returns the best program seen (the descent can
-    wander, so we track and return the best, not the last)."""
+    """Stochastic Rewrite Descent. Each iteration optionally takes a structural
+    step (every N iters) then a single parameter sweep -- with the all-rungs
+    greedy sweep that one sweep already reaches the coordinate-descent optimum,
+    so N is kept small (a few extra param-only iterations between rewrites would
+    just re-evaluate cached neighbors). Returns the best program seen, since the
+    descent can wander under the <=-acceptance rule."""
     ev = ev or Evaluator()
     rng = random.Random(cfg.seed)
 
-    program, loss = stage1_sweep(program, ev)
-    best_prog, best_loss = program, loss
+    program, loss = stage1_sweep(program, ev)        # initial tune
+    best_prog, best_loss = R.clone_program(program), loss
+    R._strip_clone_meta(best_prog)
     if cfg.verbose:
         print(f"[init] loss={loss:.4g}")
 
     for it in range(1, cfg.iters + 1):
-        program, loss = stage1_sweep(program, ev)
         if it % cfg.N == 0:
             program, _, applied = stage2_step(program, ev, cfg.K, cfg.rules, rng)
-            program, loss = stage1_sweep(program, ev)   # fully tune after structure change
             if cfg.verbose and applied:
-                print(f"[it {it}] applied {[a for a, _ in applied]} -> loss={loss:.4g}")
+                print(f"[it {it}] applied {[a for a, _ in applied]}")
+        program, loss = stage1_sweep(program, ev)    # tune (after rewrite, or refine)
         if loss < best_loss:
             best_loss, best_prog = loss, R.clone_program(program)
             R._strip_clone_meta(best_prog)

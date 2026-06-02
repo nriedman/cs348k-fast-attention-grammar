@@ -15,7 +15,7 @@ therefore remap every such reference to the corresponding cloned node, which
 
 from __future__ import annotations
 
-from kernel_ast import (
+from .kernel_ast import (
     Program, ParallelLoop, Load, Store, Compute, ReductionLoop, SpatialLoop,
     Value, Stmt, REDUCE_RULES, _value_axes, _loads_feeding, _iter_loads,
 )
@@ -41,7 +41,7 @@ def clone_program(program: Program) -> Program:
             # inputs are remapped after all producers in scope are cloned; we
             # clone the node now and fill inputs via the map (producers always
             # appear as body statements, so they are cloned by the body walk).
-            c = Compute(s.op, [], axis=s.axis)
+            c = Compute(s.op, [], axis=s.axis, const=s.const)
             c._orig_inputs = s.inputs            # stash; rewired in second pass
         elif isinstance(s, Store):
             c = Store(s.dest, None, list(s.index))

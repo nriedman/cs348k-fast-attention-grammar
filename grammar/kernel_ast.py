@@ -58,6 +58,8 @@ class Compute(Stmt, Value):
                                    # input axis collapsed away. None otherwise --
                                    # matmul's reduced axis is inferred from its
                                    # two inputs' shared index; elementwise has none.
+    const: float = None            # compile-time scalar for const ops (mulc/addc),
+                                   # e.g. 1/D for a mean or eps for a variance floor.
 
 
 @dataclass
@@ -152,12 +154,18 @@ SHAPE_RULES = {
     "div": _elementwise,
     "relu": _elementwise,
     "exp": _elementwise,
+    "sqrt": _elementwise,
+    "mulc": _elementwise,          # x * const
+    "addc": _elementwise,          # x + const
     "rowmax": _row_reduce,
     "rowsum": _row_reduce,
 }
 
 # ops whose output collapses one input axis to size 1 (a per-row reduction).
 ROW_REDUCE_OPS = {"rowmax", "rowsum"}
+
+# unary ops carrying a compile-time scalar in Compute.const (mean's 1/D, eps).
+CONST_OPS = {"mulc": "*", "addc": "+"}
 
 
 # --------------------------------------------------------------------------
@@ -176,6 +184,7 @@ EMIT_RULES = {
     "relu":   lambda a: f"ct.maximum(0, {a[0]})",
     "mul":    lambda a: f"{a[0]} * {a[1]}",
     "exp":    lambda a: f"ct.exp({a[0]})",
+    "sqrt":   lambda a: f"ct.sqrt({a[0]})",
 }
 
 # row-reduction emission needs the collapsed-axis position; keyed separately so
@@ -494,7 +503,7 @@ def structural_key(node: Node, _memo: dict[int, tuple] | None = None) -> tuple:
     elif isinstance(node, Load):
         key = ("Load", node.source, tuple(node.index))
     elif isinstance(node, Compute):
-        key = ("Compute", node.op,
+        key = ("Compute", node.op, node.axis, node.const,
                tuple(structural_key(i, _memo) for i in node.inputs))
     elif isinstance(node, Store):
         key = ("Store", node.dest, tuple(node.index), structural_key(node.src, _memo))
@@ -775,6 +784,8 @@ def _emit_kernel(loop: ParallelLoop, tensors: dict[str, Shape],
                     if stmt.op in ROW_REDUCE_OPS:
                         ax = _value_axes(stmt).index(stmt.axis)
                         out.append(f"{ind}{v} = {ROW_EMIT_RULES[stmt.op](args, ax)}")
+                    elif stmt.op in CONST_OPS:
+                        out.append(f"{ind}{v} = ({args[0]} {CONST_OPS[stmt.op]} {stmt.const!r})")
                     else:
                         out.append(f"{ind}{v} = {EMIT_RULES[stmt.op](args)}")
             elif isinstance(stmt, ReductionLoop):
