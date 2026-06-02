@@ -668,3 +668,126 @@ def merge_reductions(program: Program, first: ReductionLoop,
     _strip_clone_meta(new)
     # collapse loads now shared between the two reductions' bodies
     return dedup_loads(new)
+
+
+# ==========================================================================
+# STEP 5 -- Reorder: swap two adjacent sibling nodes.
+#
+# A pure, orthogonal primitive: it swaps the execution order of two adjacent
+# siblings (any kinds -- ParallelLoop/ParallelLoop, Load/ReductionLoop, etc.)
+# whenever doing so respects data flow. Its purpose is to bring a producer and
+# consumer adjacent so Merge / merge_reductions can fire; the search prunes the
+# many legal-but-inert swaps (e.g. Load/Load).
+#
+# Legal iff (a) neither node depends on the other through tile references
+# (no read-after-write either direction -- the swap must not invert a real
+# edge), and (b) they do not both write the same tensor (write-write hazard,
+# which pure dataflow reachability cannot see). For sibling statements the edge
+# is tile dataflow; for ParallelLoop stages it is the tensor edge (stage_deps).
+# ==========================================================================
+def _depends_on(consumer, producer) -> bool:
+    """True if `consumer` reads (transitively) a tile produced by `producer`.
+    Covers every reference kind: Compute.inputs, Store.src, and a ReductionLoop's
+    whole body (its partials AND any other body statement's inputs)."""
+    target = {id(producer)}
+
+    # nodes whose dataflow `consumer` depends on
+    def surface(node):
+        if isinstance(node, Compute):
+            return list(node.inputs)
+        if isinstance(node, Store):
+            return [node.src]
+        if isinstance(node, ReductionLoop):
+            # a reduction depends on everything its body reads from outside:
+            # gather all inputs referenced anywhere in the body.
+            refs = []
+            for s in _all_stmts(node.body):
+                if isinstance(s, Compute):
+                    refs.extend(s.inputs)
+                elif isinstance(s, Store):
+                    refs.append(s.src)
+            refs.extend(node.partials)
+            return refs
+        return []
+
+    seen = set()
+    stack = list(surface(consumer))
+    while stack:
+        v = stack.pop()
+        if id(v) in target:
+            return True
+        if id(v) in seen:
+            continue
+        seen.add(id(v))
+        stack.extend(surface(v))
+    return False
+
+
+def _writes(node) -> set:
+    """Tensor names this node writes (Store.dest, or a stage's output)."""
+    if isinstance(node, Store):
+        return {node.dest}
+    if isinstance(node, ParallelLoop):
+        return {node.out}
+    return set()
+
+
+def can_reorder(program: Program, first, second) -> tuple:
+    """Legal iff first and second are immediately-adjacent siblings, neither
+    depends on the other (no tile/tensor RAW either direction), and they do not
+    both write the same tensor."""
+    # ParallelLoop stages: siblings in program.body
+    if isinstance(first, ParallelLoop) and isinstance(second, ParallelLoop):
+        ia, ib = _stage_index(program, first), _stage_index(program, second)
+        if ia < 0 or ib < 0:
+            return False, "stage not found in program"
+        if abs(ia - ib) != 1:
+            return False, "stages are not adjacent"
+        a, b = (first, second) if ia < ib else (second, first)
+        # RAW: later stage reads earlier stage's output
+        if stage_output(a) in stage_inputs(b):
+            return False, "later stage consumes the earlier stage's output"
+        # WAW: both write the same tensor
+        if _writes(a) & _writes(b):
+            return False, "stages write the same tensor (write-write hazard)"
+        return True, ""
+
+    # statements within one kernel body: must be adjacent siblings
+    fscope, sscope = _scope_of(program, first), _scope_of(program, second)
+    if fscope is None or sscope is None:
+        return False, "node not found in program"
+    if fscope != sscope:
+        return False, "nodes are not siblings in the same body"
+    body = fscope[-1].body
+    fi, si = _index_of(body, first), _index_of(body, second)
+    if abs(fi - si) != 1:
+        return False, "nodes are not immediately adjacent"
+    a, b = (first, second) if fi < si else (second, first)
+    # neither may depend on the other (a real edge would be inverted by the swap)
+    if _depends_on(b, a):
+        return False, "second node depends on the first (tile dataflow)"
+    if _depends_on(a, b):
+        return False, "first node depends on the second (tile dataflow)"
+    # write-write hazard (dataflow reachability cannot see this)
+    if _writes(a) & _writes(b):
+        return False, "nodes write the same tensor (write-write hazard)"
+    return True, ""
+
+
+def reorder(program: Program, first, second) -> Program:
+    """Return a new program with the two adjacent siblings `first` and `second`
+    swapped in their body."""
+    ok, why = can_reorder(program, first, second)
+    if not ok:
+        raise ValueError(f"cannot reorder: {why}")
+    new = clone_program(program)
+    A = new._clone_map[id(first)]
+    B = new._clone_map[id(second)]
+    if isinstance(A, ParallelLoop) and isinstance(B, ParallelLoop):
+        body = new.body
+    else:
+        body = _scope_of(new, A)[-1].body
+    ia, ib = _index_of(body, A), _index_of(body, B)
+    body[ia], body[ib] = body[ib], body[ia]
+    _strip_clone_meta(new)
+    return new

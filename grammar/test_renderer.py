@@ -700,6 +700,52 @@ def rewrite_checks(cp, is_gpu, refmath):
     reject_dep = not can_merge_reductions(dep, D1, D2)[0]
     results.append(("merge_reductions_precondition", reject_dep,
                     "dependent (second reads first) reduction-merge rejected"))
+
+    # --- Reorder: swap adjacent siblings; its purpose is to enable a Merge ---
+    from rewrites import reorder, can_reorder
+
+    def build_three_stage():
+        x, y = Load("x", ["n", "k"]), Load("y", ["k", "m"])
+        mm = Compute("matmul", [x, y])
+        sA = ParallelLoop("a", (64, 64), ("n", "m"), [x, y, mm, Store("a", mm, ["n", "m"])])
+        w = Load("w", ["n", "m"]); rz = Compute("relu", [w])
+        sZ = ParallelLoop("z", (64, 64), ("n", "m"), [w, rz, Store("z", rz, ["n", "m"])])
+        a2, b2 = Load("a", ["n", "m"]), Load("b", ["n", "m"])
+        add = Compute("add", [a2, b2])
+        sO = ParallelLoop("o", (64, 64), ("n", "m"), [a2, b2, add, Store("o", add, ["n", "m"])])
+        return Program({"x": (256, 128), "y": (128, 256), "w": (256, 256),
+                        "b": (256, 256), "a": (256, 256), "z": (256, 256),
+                        "o": (256, 256)}, [sA, sZ, sO]), sA, sZ, sO
+
+    tri, sA, sZ, sO = build_three_stage()
+    # a and o are not adjacent (z between); reorder the independent z past o,
+    # which makes a and o adjacent so Merge can fire.
+    merge_blocked = not can_merge(tri, sA, sO)[0]
+    reordered = reorder(tri, sZ, sO)
+    sA2 = next(s for s in reordered.body if s.out == "a")
+    sO2 = next(s for s in reordered.body if s.out == "o")
+    enables = can_merge(reordered, sA2, sO2)[0]
+    order_ok = [s.out for s in reordered.body] == ["a", "o", "z"]
+    results.append(("reorder_enables_merge", merge_blocked and enables and order_ok,
+                    f"merge blocked before, enabled after; order={[s.out for s in reordered.body]}"))
+
+    # original untouched
+    results.append(("reorder_no_mutation", [s.out for s in tri.body] == ["a", "z", "o"],
+                    "input tree stage order unchanged"))
+
+    # RAW rejection: a-stage then a stage that reads `a`
+    raw, rsA, _, rsO = build_three_stage()
+    raw2 = Program(dict(raw.tensors), [rsA, rsO])   # adjacent a then o (o reads a)
+    reject_raw = not can_reorder(raw2, rsA, rsO)[0]
+    # statement-level: independent loads swap; load+consumer rejected
+    la, lb = Load("a", ["n", "m"]), Load("b", ["n", "m"]); ad = Compute("add", [la, lb])
+    sp = Program({"a": (256, 256), "b": (256, 256), "o": (256, 256)},
+                 [ParallelLoop("o", (64, 64), ("n", "m"),
+                               [la, lb, ad, Store("o", ad, ["n", "m"])])])
+    allow_loads = can_reorder(sp, la, lb)[0]
+    reject_dep_stmt = not can_reorder(sp, lb, ad)[0]
+    results.append(("reorder_precondition", reject_raw and allow_loads and reject_dep_stmt,
+                    "RAW stages rejected, independent loads allowed, dependent stmt rejected"))
     return results
 
 
