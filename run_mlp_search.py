@@ -101,7 +101,7 @@ def describe(program: Program) -> str:
 
 def verify(program: Program, B: int, Dm: int, H: int, eps: float = 1e-5) -> bool:
     import cupy as cp
-    from optimization import _import_source
+    from grammar.optimization import _import_source
     mod = _import_source(emit_module(program))
     rng = cp.random.RandomState(1)
     ins = {nm: rng.randn(*s).astype(cp.float32) for nm, s in mod.KERNEL_META["inputs"]}
