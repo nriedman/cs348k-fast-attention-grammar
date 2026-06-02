@@ -1,0 +1,43 @@
+{
+  "label": "example",
+  "device": "NVIDIA L4",
+  "config": {
+    "dtype": "fp32",
+    "inputs": [
+      [
+        "W1",
+        [
+          64,
+          64
+        ]
+      ],
+      [
+        "W2",
+        [
+          64,
+          64
+        ]
+      ],
+      [
+        "X",
+        [
+          64,
+          64
+        ]
+      ]
+    ],
+    "output": [
+      "out",
+      [
+        64,
+        64
+      ]
+    ]
+  },
+  "stats": {
+    "mean_gpu_ms": 0.09140735626220703,
+    "iters": 200,
+    "failed": false,
+    "tflops": 0.012053997020101504
+  }
+}

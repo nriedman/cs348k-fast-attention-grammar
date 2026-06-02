@@ -35,11 +35,18 @@ import os
 import importlib.util
 from dataclasses import dataclass, field
 
-from .kernel_ast import (
+from kernel_ast import (
     Program, ParallelLoop, ReductionLoop, SpatialLoop, Load, Store, Compute,
-    emit_module, structural_key,
+    emit_module, structural_key, peak_tile_bytes,
 )
-from . import rewrites as R
+import rewrites as R
+
+
+# A penalised (over-memory-budget) program scores MEM_PENALTY_BASE + KB. The base
+# is far above any plausible kernel runtime in ms, so any program that actually
+# compiles and runs always ranks better than one rejected for memory -- while the
+# +KB term gives a gradient among penalised programs toward smaller footprints.
+MEM_PENALTY_BASE = 1e9
 
 
 # ==========================================================================
@@ -58,6 +65,17 @@ class EvalConfig:
     proxy: bool = False                 # dev-only: skip GPU, use a cheap fake score
     seed: int = 0
     log: bool = False                   # per-eval phase timing (emit / compile / run)
+    mem_budget: int = 64 * 1024         # bytes; the LARGEST single per-block tile
+                                        # may not exceed this. An L4 SM gives a
+                                        # block up to ~99 KB of shared memory, so a
+                                        # tile near/over that can't be scheduled and
+                                        # makes cuTile/ptxas struggle. 64 KB leaves
+                                        # headroom for register pressure + overhead;
+                                        # raise toward 99 KB if the search runs clean.
+                                        # Over-budget programs are NOT compiled; they
+                                        # score a large, size-proportional penalty so
+                                        # the search still descends toward feasibility.
+                                        # 0 disables.
 
 
 class Evaluator:
@@ -82,9 +100,19 @@ class Evaluator:
         t0 = time.perf_counter()
         try:
             src = emit_module(program)
+        except AssertionError:
+            # Inference found a value demanded at two irreconcilable tile widths.
+            # This is an ILLEGAL FUSION (e.g. a stage that both tiles an axis and
+            # reduces, over that axis, a value computed within it -- the flash-style
+            # boundary). It is correctly infeasible; report it cleanly rather than
+            # as a raw assertion traceback.
+            if self.cfg.log:
+                print("[eval] illegal fusion (incompatible tile widths) -> inf",
+                      flush=True)
+            return math.inf
         except Exception as e:
             if self.cfg.log:
-                print(f"[eval] emit FAILED ({type(e).__name__}: {e}) -> inf", flush=True)
+                print(f"[eval] emit failed ({type(e).__name__}) -> inf", flush=True)
             return math.inf                 # invalid / unrenderable structure
         if self.cfg.log:
             tiles = " ".join(f"{l.out}{tuple(l.tile_shape)}" for l in program.body)
@@ -92,6 +120,23 @@ class Evaluator:
                   f"{len(program.body)} stage(s): {tiles}", flush=True)
         if self.cfg.proxy:
             return _proxy_score(program, src)
+        # Memory pre-check: a kernel whose resident tile footprint exceeds the
+        # budget will blow up the compiler (and can exhaust host RAM), so we do
+        # NOT compile it. Instead of inf -- which gives the search no direction --
+        # we return a large penalty PROPORTIONAL to the footprint, so descent
+        # still feels a gradient pulling tiles smaller until a program fits and
+        # actually compiles. The MEM_PENALTY_BASE offset keeps every penalised
+        # score far above any real runtime (ms), so a compilable program always
+        # beats an over-budget one.
+        if self.cfg.mem_budget:
+            footprint = peak_tile_bytes(program)
+            if footprint > self.cfg.mem_budget:
+                penalty = MEM_PENALTY_BASE + footprint / 1024.0   # +1 per KB
+                if self.cfg.log:
+                    print(f"[eval] OVER BUDGET {footprint/1024:.0f}KB > "
+                          f"{self.cfg.mem_budget/1024:.0f}KB -> penalty {penalty:.0f} "
+                          f"(not compiled)", flush=True)
+                return penalty
         self._compiles += 1
         try:
             return self._run_gpu(src)

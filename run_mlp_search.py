@@ -166,12 +166,17 @@ def main():
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--proxy", action="store_true")
     ap.add_argument("--log", action="store_true", help="per-eval phase timing")
+    ap.add_argument("--mem-budget-kb", type=int, default=64, dest="mem_budget_kb",
+                    help="largest single per-block tile budget (KB); programs whose "
+                         "biggest tile exceeds it are penalized, not compiled. The L4 "
+                         "SMEM limit is ~99 KB; 64 leaves headroom. 0 disables.")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
     prog = build_mlp_ln(args.b, args.dm, args.h, tile=args.tile, subtile_k=args.subtile_k)
     ev = Evaluator(EvalConfig(warmup=args.warmup, iters=args.reps,
-                              proxy=args.proxy, seed=args.seed, log=args.log))
+                              proxy=args.proxy, seed=args.seed, log=args.log,
+                              mem_budget=args.mem_budget_kb * 1024))
 
     print(f"task: MLP + residual + LayerNorm   X[{args.b},{args.dm}] "
           f"W1[{args.dm},{args.h}] W2[{args.h},{args.dm}]  fp32")

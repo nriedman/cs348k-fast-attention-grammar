@@ -595,27 +595,43 @@ def _infer_program(program: Program) -> dict[int, Shape]:
         r._scope = set(loop.index_vars)
         r._seed_shapes(loop.body, loop, {})
 
+    # A top-level Load feeding a row-reduction (rowsum/rowmax) over axis `a`
+    # must keep its FULL extent on `a` even though `a` is an output index var:
+    # the reduction needs the whole row, not just this block's output slice.
+    # Collect, per kernel, the (id(load), axis) pairs that must stay full.
+    def reduced_axis_loads(stmts, acc):
+        for s in stmts:
+            if isinstance(s, Compute) and s.op in ROW_REDUCE_OPS:
+                for ld in _loads_feeding(s):
+                    acc.setdefault(id(ld), set()).add(s.axis)
+            if isinstance(s, (ReductionLoop, SpatialLoop)):
+                reduced_axis_loads(s.body, acc)
+        return acc
+
     # re-resolve each Load at its lexical scope: an axis subtiled only by a loop
     # the Load is NOT inside stays at full extent.
-    def fix(stmts, loop, sub_axes: set[str], red_axes: set[str]):
+    def fix(stmts, loop, sub_axes: set[str], red_axes: set[str], rax: dict):
         for s in stmts:
             if isinstance(s, Load):
                 g = program.tensors[s.source]
+                full_on = rax.get(id(s), set())     # axes this load reduces over
                 shp = []
                 for d, a in enumerate(s.index):
-                    if a in loop.index_vars:           # output axis: TS, or SUB if inside
+                    if a in full_on:                   # feeds a row-reduction over `a`:
+                        shp.append(g[d])               # keep the FULL reduced extent
+                    elif a in loop.index_vars:         # output axis: TS, or SUB if inside
                         base = loop.tile_shape[loop.index_vars.index(a)]
                         shp.append(r.shapes[id(s)][d] if a in sub_axes else base)
                     else:                              # contraction axis
                         shp.append(r.shapes[id(s)][d] if a in red_axes else g[d])
                 r.shapes[id(s)] = tuple(shp)
             elif isinstance(s, SpatialLoop):
-                fix(s.body, loop, sub_axes | {s.axis}, red_axes)
+                fix(s.body, loop, sub_axes | {s.axis}, red_axes, rax)
             elif isinstance(s, ReductionLoop):
-                fix(s.body, loop, sub_axes, red_axes | {s.axis})
+                fix(s.body, loop, sub_axes, red_axes | {s.axis}, rax)
 
     for loop in program.body:
-        fix(loop.body, loop, set(), set())
+        fix(loop.body, loop, set(), set(), reduced_axis_loads(loop.body, {}))
     return r.shapes
 
 
@@ -952,13 +968,59 @@ def _iter_reductions(stmts):
             yield from _iter_reductions(s.body)
 
 
-def program_flops(program: Program, shapes: dict[int, Shape] | None = None):
-    """Total FLOPs from the AST. Exact for matmul/elementwise; if any op has
-    no rule, returns exact=False so callers can suppress TFLOP/s. Tiling the
-    contraction (a ReductionLoop) does not change the total -- a matmul is
-    always 2*M*N*K -- so we use the global contraction extent, not TS_k."""
+def _tile_producing_nodes(body):
+    """Every node that materialises a tile in a kernel body: Loads, Compute
+    results, and reduction accumulators (partials). Descends into loops."""
+    for s in body:
+        if isinstance(s, (Load, Compute)):
+            yield s
+        if isinstance(s, (ReductionLoop, SpatialLoop)):
+            yield from _tile_producing_nodes(s.body)
+            if isinstance(s, ReductionLoop):
+                yield from s.partials
+
+
+def peak_tile_bytes(program: Program, shapes: dict[int, Shape] | None = None,
+                    dtype_bytes: int = 4) -> int:
+    """Largest single per-block tile across the whole program, in bytes.
+
+    Each tile's shape (from inference) is already the PER-BLOCK shape -- grid
+    dimensions are tiled, contractions are TS_k or full-extent depending on the
+    loop nesting -- so `prod(shape) * dtype_bytes` is the bytes one thread block
+    holds for that tile. We take the maximum over every materialised tile (loads,
+    compute outputs, reduction accumulators) in every kernel.
+
+    This is a cheap (no-compile) lower bound on a block's shared-memory demand,
+    grounded in the hardware: an L4 SM gives a thread block up to ~99 KB of SMEM,
+    so a single tile near or above that cannot be scheduled and makes cuTile/ptxas
+    struggle. A full-K matmul's (TS, K) operand or a row-reduction's full (TILE, D)
+    row shows up here as one oversized tile. We bound the LARGEST single tile
+    rather than the sum of all tiles, because the sum over-counts (not all tiles
+    are live simultaneously) whereas the largest tile is a true per-block floor on
+    demand and maps directly onto the SMEM limit. The search penalises (does not
+    compile) programs whose largest tile exceeds the budget."""
     if shapes is None:
         shapes = _infer_program(program)
+    peak = 0
+    for loop in program.body:
+        for n in _tile_producing_nodes(loop.body):
+            shp = shapes.get(id(n))
+            if shp is not None:
+                peak = max(peak, math.prod(shp) * dtype_bytes)
+    return peak
+
+
+def program_flops(program: Program, shapes: dict[int, Shape] | None = None):
+    """Total FLOPs from the AST. Exact for matmul, pointwise ops, and row
+    reductions; if any op has no rule, returns exact=False so callers can
+    suppress TFLOP/s. Tiling the contraction (a ReductionLoop) does not change
+    the total -- a matmul is always 2*M*N*K -- so we use the global contraction
+    extent, not TS_k."""
+    if shapes is None:
+        shapes = _infer_program(program)
+    # one logical FLOP per output element (div/sqrt cost more cycles in hardware,
+    # but a logical FLOP count treats them as one op per element).
+    POINTWISE = {"add", "mul", "sub", "div", "relu", "exp", "sqrt", "mulc", "addc"}
     total, exact = 0, True
     for loop in program.body:
         gout = math.prod(program.tensors[loop.out])
@@ -968,7 +1030,20 @@ def program_flops(program: Program, shapes: dict[int, Shape] | None = None):
                 k = (program.tensors[inp0.source][-1] if isinstance(inp0, Load)
                      else shapes[id(inp0)][-1])      # global K, not the tile TS_k
                 total += 2 * gout * k                # 2*M*N*K
-            elif stmt.op in ("add", "mul", "relu", "exp"):
+            elif stmt.op in ROW_REDUCE_OPS:
+                # a per-row reduction reads its full input row and accumulates:
+                # ~one add/compare per input element. Count from GLOBAL extents
+                # (number of output rows x the full reduced-axis extent), not the
+                # tile, so the total is tiling-invariant like the matmul.
+                axes = _value_axes(stmt)
+                red_ext = _axis_global_extent(stmt, stmt.axis, program.tensors)
+                rows = 1
+                for a in axes:
+                    if a == stmt.axis:
+                        continue
+                    rows *= _axis_global_extent(stmt, a, program.tensors)
+                total += rows * red_ext
+            elif stmt.op in POINTWISE:
                 total += gout
             else:
                 exact = False

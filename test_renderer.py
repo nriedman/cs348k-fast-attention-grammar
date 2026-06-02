@@ -423,6 +423,29 @@ def p_layernorm():               # sqrt + const ops + row-reduction broadcast
                                   Store("o", out, ["b", "f"])])])
 
 
+def p_layernorm_ftiled():        # LayerNorm with the REDUCED feature axis tiled
+    # Same as p_layernorm but the output tile subdivides the feature axis (f) to
+    # 64 of 128. Each grid block produces 64 output columns, but every rowsum
+    # over f must STILL reduce the full 128-wide row -- so the loads feeding the
+    # rowsums must stay full-extent on f regardless of the output tile. Pins that
+    # a row-reduction's input is not narrowed to the output tile.
+    D, eps = 128, 1e-5
+    rL = Load("r", ["b", "f"]); s1 = Compute("rowsum", [rL], axis="f")
+    r2a, r2b = Load("r", ["b", "f"]), Load("r", ["b", "f"])
+    rr = Compute("mul", [r2a, r2b]); s2 = Compute("rowsum", [rr], axis="f")
+    mean = Compute("mulc", [s1], const=1.0 / D)
+    meansq = Compute("mulc", [s2], const=1.0 / D)
+    mean2 = Compute("mul", [mean, mean]); var = Compute("sub", [meansq, mean2])
+    vareps = Compute("addc", [var], const=eps); std = Compute("sqrt", [vareps])
+    r3 = Load("r", ["b", "f"]); centered = Compute("sub", [r3, mean])
+    out = Compute("div", [centered, std])
+    return Program({"r": (64, D), "o": (64, D)},
+                   [ParallelLoop("o", (64, 64), ("b", "f"),     # feature tiled to 64
+                                 [rL, s1, r2a, r2b, rr, s2, mean, meansq, mean2,
+                                  var, vareps, std, r3, centered, out,
+                                  Store("o", out, ["b", "f"])])])
+
+
 def _ref_layernorm(M, i):
     r = i["r"]; D = 128
     mean = M.mulc(M.rowsum(r), 1.0 / D)
@@ -489,6 +512,7 @@ CASES = [
     Case("batched_4d_relu",     p_batched_4d_relu,     lambda M, i: M.relu(i["x"])),
     Case("tname_collision",     p_tname_collision,     lambda M, i: M.mul(M.add(i["a"], i["b"]), i["c"])),
     Case("layernorm",           p_layernorm,           _ref_layernorm),
+    Case("layernorm_ftiled",    p_layernorm_ftiled,    _ref_layernorm),
 ]
 
 # Programs that MUST be rejected by validate() (inner->outer flow).
@@ -543,7 +567,7 @@ def rewrite_checks(cp, is_gpu, refmath):
     """Hoist/Sink correctness: the rewritten kernel must compute the same result
     as the original (the load-inside <-> load-outside equivalence), the rewrite
     must not mutate the input tree, and preconditions must gate illegal moves."""
-    from rewrites import hoist, sink, clone_program, can_hoist, can_sink
+    from grammar.rewrites import hoist, sink, clone_program, can_hoist, can_sink
     results = []
 
     def numeric(prog):
@@ -621,7 +645,7 @@ def rewrite_checks(cp, is_gpu, refmath):
     results.append(("sink_precondition", reject_sink, "outside-consumer sink rejected"))
 
     # --- SubtileReduction: full-K matmul -> tiled reduction, same result ---
-    from rewrites import subtile_reduction, can_subtile_reduction
+    from grammar.rewrites import subtile_reduction, can_subtile_reduction
 
     def build_fullk():
         x, y = Load("x", ["n", "k"]), Load("y", ["k", "m"])
@@ -657,7 +681,7 @@ def rewrite_checks(cp, is_gpu, refmath):
                     "rejects output-axis, non-reducible, and re-reduction"))
 
     # --- UnwrapReduction: exact inverse of SubtileReduction ---
-    from rewrites import unwrap_reduction, can_unwrap_reduction, sink as _sink
+    from grammar.rewrites import unwrap_reduction, can_unwrap_reduction, sink as _sink
 
     full2, mm2 = build_fullk()
     src_before = emit_module(full2)
@@ -677,7 +701,7 @@ def rewrite_checks(cp, is_gpu, refmath):
     results.append(("unwrap_precondition", reject, "non-bare reduction body rejected"))
 
     # --- Merge: fuse matmul -> add into one kernel; drop the intermediate ---
-    from rewrites import merge, can_merge
+    from grammar.rewrites import merge, can_merge
 
     def build_two_stage():
         x, y = Load("x", ["n", "k"]), Load("y", ["k", "m"])
@@ -713,7 +737,7 @@ def rewrite_checks(cp, is_gpu, refmath):
     results.append(("merge_precondition", reject_merge, "shared-intermediate merge rejected"))
 
     # --- merge_reductions: fuse two same-axis sibling reductions, dedup loads ---
-    from rewrites import merge_reductions, can_merge_reductions
+    from grammar.rewrites import merge_reductions, can_merge_reductions
 
     def build_two_reductions():
         # s1 = sum(x) over k ; s2 = sum(x*x) over k ; O = s1 + s2  (one kernel)
@@ -759,7 +783,7 @@ def rewrite_checks(cp, is_gpu, refmath):
                     "dependent (second reads first) reduction-merge rejected"))
 
     # --- Reorder: swap adjacent siblings; its purpose is to enable a Merge ---
-    from rewrites import reorder, can_reorder
+    from grammar.rewrites import reorder, can_reorder
 
     def build_three_stage():
         x, y = Load("x", ["n", "k"]), Load("y", ["k", "m"])
