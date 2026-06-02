@@ -1,21 +1,19 @@
 {
   "search": {
-    "iters": 32,
+    "iters": 64,
     "N": 4,
     "K": 5,
     "depth": 1,
     "rules": [
-      "hoist",
-      "sink",
       "subtile_reduction",
-      "unwrap_reduction",
+      "sink",
       "merge",
       "merge_reductions",
       "reorder"
     ],
     "seed": 0,
     "verbose": true,
-    "run_dir": "runs/attn_full",
+    "run_dir": "runs/attn_norev",
     "resume": true,
     "tile_ladder": null,
     "couple_tiles": false
