@@ -47,8 +47,8 @@ def clone_program(program: Program) -> Program:
             c = Store(s.dest, None, list(s.index))
             c._orig_src = s.src
         elif isinstance(s, ReductionLoop):
-            c = ReductionLoop(s.axis, s.tile, [clone_stmt(b) for b in s.body], None)
-            c._orig_partial = s.partial
+            c = ReductionLoop(s.axis, s.tile, [clone_stmt(b) for b in s.body])
+            c._orig_partials = list(s.partials)
         elif isinstance(s, SpatialLoop):
             c = SpatialLoop(s.axis, s.tile, [clone_stmt(b) for b in s.body])
         else:
@@ -73,8 +73,9 @@ def clone_program(program: Program) -> Program:
             s.src = cmap[id(s._orig_src)]
             del s._orig_src
         elif isinstance(s, ReductionLoop):
-            s.partial = cmap[id(s._orig_partial)]
-            del s._orig_partial
+            s.partials = [cmap[id(p)] for p in s._orig_partials]
+            s.partial = s.partials[0] if s.partials else None
+            del s._orig_partials
             for b in s.body:
                 rewire(b)
         elif isinstance(s, SpatialLoop):
@@ -163,8 +164,8 @@ def hoist(program: Program, load: Load) -> Program:
     scope = _scope_of(new, cload)       # enclosing loops, outermost first
     loop = scope[-1]                    # immediate enclosing loop
     parent_body = scope[-2].body        # the loop's parent (len>=2 guaranteed)
-    loop.body.remove(cload)
-    parent_body.insert(parent_body.index(loop), cload)
+    loop.body[:] = [s for s in loop.body if s is not cload]
+    parent_body.insert(_index_of(parent_body, loop), cload)
     _strip_clone_meta(new)
     return new
 
@@ -207,7 +208,7 @@ def sink(program: Program, load: Load, loop) -> Program:
     cloop = new._clone_map[id(loop)]
     lscope = _scope_of(new, cload)      # enclosing loops, outermost first
     cur_body = lscope[-1].body          # body that currently holds the load
-    cur_body.remove(cload)
+    cur_body[:] = [s for s in cur_body if s is not cload]
     cloop.body.insert(0, cload)
     _strip_clone_meta(new)
     return new
@@ -219,6 +220,16 @@ def sink(program: Program, load: Load, loop) -> Program:
 def _strip_clone_meta(program: Program) -> None:
     if hasattr(program, "_clone_map"):
         del program._clone_map
+
+
+def _index_of(body: list, node) -> int:
+    """Position of `node` in `body` BY IDENTITY. dataclass __eq__ makes
+    structurally identical nodes (e.g. two Load('x',['n','k'])) compare equal,
+    so list.index would return the wrong position."""
+    for i, s in enumerate(body):
+        if s is node:
+            return i
+    raise ValueError("node not found in body")
 
 
 # --------------------------------------------------------------------------
@@ -294,7 +305,7 @@ def subtile_reduction(program: Program, compute: Compute, axis: str,
 
     # wrap ONLY the compute; loads remain in place and are extracted from.
     red = ReductionLoop(axis, tile, [ccomp], ccomp)
-    body[body.index(ccomp)] = red
+    body[_index_of(body, ccomp)] = red
 
     # every consumer that referenced the bare Compute must now reference the
     # ReductionLoop -- the loop is the Value whose result is the accumulator.
@@ -350,7 +361,7 @@ def unwrap_reduction(program: Program, loop: ReductionLoop) -> Program:
     body = scope[-1].body                       # body that directly holds cloop
 
     # replace the loop with its Compute in the same slot
-    body[body.index(cloop)] = ccomp
+    body[_index_of(body, cloop)] = ccomp
 
     # every consumer that referenced the ReductionLoop now references the Compute
     for c in _consumers(new, cloop):
@@ -516,3 +527,144 @@ def _program_io_names(program: Program):
         for ld in _iter_loads(loop.body):
             read.add(ld.source)
     return (sorted(read - written), sorted(written & read), sorted(written - read))
+
+
+# ==========================================================================
+# STEP 4a -- dedup_loads: rewrite-time CSE on Load nodes.
+#
+# After fusing two reduction loops, their bodies concatenate; if both contained
+# a Load of the same tensor at the same index, those are two distinct Load nodes
+# emitting two ct.load calls. This pass collapses structurally identical Loads
+# (same source AND index) that live in the SAME body to a single node, rebinding
+# every consumer of the duplicates to the survivor. Standalone and reusable --
+# run it after any fusion to recover load reuse.
+# ==========================================================================
+def dedup_loads(program: Program) -> Program:
+    """Return a new program where structurally identical sibling Loads (same
+    source + index, same body) are collapsed to one, consumers rebound."""
+    new = clone_program(program)
+
+    def dedup_body(body):
+        survivors: dict[tuple, Load] = {}
+        removed: list[Load] = []
+        for s in body:
+            if isinstance(s, Load):
+                key = (s.source, tuple(s.index))
+                if key in survivors:
+                    keep = survivors[key]
+                    for c in _consumers(new, s):        # rebind to the survivor
+                        if isinstance(c, Compute):
+                            c.inputs = [keep if i is s else i for i in c.inputs]
+                        elif isinstance(c, Store):
+                            if c.src is s:
+                                c.src = keep
+                        elif isinstance(c, ReductionLoop):
+                            c.partials = [keep if p is s else p for p in c.partials]
+                            c.partial = c.partials[0] if c.partials else None
+                    removed.append(s)
+                else:
+                    survivors[key] = s
+            elif isinstance(s, (ReductionLoop, SpatialLoop)):
+                dedup_body(s.body)
+        # rebuild the body excluding removed nodes BY IDENTITY -- Load is a
+        # dataclass, so list.remove (which uses ==) would drop the wrong one.
+        rid = {id(r) for r in removed}
+        body[:] = [s for s in body if id(s) not in rid]
+
+    for loop in new.body:
+        dedup_body(loop.body)
+    _strip_clone_meta(new)
+    return new
+
+
+# ==========================================================================
+# STEP 4b -- merge_reductions: fuse two adjacent sibling ReductionLoops.
+#
+# Two reduction loops in the same body fuse into one (sharing the iteration)
+# iff: same axis, same tile, immediately adjacent, and the second references
+# NEITHER the first loop NOR any of the first's partials (independence -- shared
+# *inputs* are allowed and are the point). The fused loop carries both loops'
+# partials; consumers of each partial already reference it directly, so the only
+# rewiring is redirecting consumers of the SECOND loop's Value to its partial.
+# dedup_loads is then run to collapse shared input loads.
+# ==========================================================================
+def _refs_in(node, targets: set) -> bool:
+    """True if any node in the dataflow under `node` is one of `targets` (by id)."""
+    seen = set()
+    def walk(v):
+        if id(v) in targets:
+            return True
+        if id(v) in seen:
+            return False
+        seen.add(id(v))
+        if isinstance(v, Compute):
+            return any(walk(i) for i in v.inputs)
+        if isinstance(v, ReductionLoop):
+            return any(walk(p) for p in v.partials)
+        return False
+    return walk(node)
+
+
+def can_merge_reductions(program: Program, first: ReductionLoop,
+                         second: ReductionLoop) -> tuple:
+    """Legal iff first and second are adjacent siblings in the same body, same
+    axis and tile, and `second` references neither `first` nor first's partials
+    (independence; shared inputs allowed)."""
+    if not isinstance(first, ReductionLoop) or not isinstance(second, ReductionLoop):
+        return False, "both targets must be ReductionLoops"
+    fscope, sscope = _scope_of(program, first), _scope_of(program, second)
+    if fscope is None or sscope is None:
+        return False, "loop not found in program"
+    if fscope != sscope:
+        return False, "loops are not siblings in the same body"
+    body = fscope[-1].body
+    fi, si = _index_of(body, first), _index_of(body, second)
+    if si != fi + 1:
+        return False, "loops are not immediately adjacent (first then second)"
+    if first.axis != second.axis:
+        return False, f"different reduction axes ({first.axis!r} vs {second.axis!r})"
+    if first.tile != second.tile:
+        return False, f"different tile sizes ({first.tile} vs {second.tile})"
+    # independence: second must not consume first's result or any of its partials
+    forbidden = {id(first)} | {id(p) for p in first.partials}
+    for p in second.partials:
+        if _refs_in(p, forbidden):
+            return False, "second reduction depends on the first's result/partials"
+    return True, ""
+
+
+def merge_reductions(program: Program, first: ReductionLoop,
+                     second: ReductionLoop) -> Program:
+    """Return a new program with `first` and `second` fused into one
+    ReductionLoop carrying both loops' partials, then load-deduplicated."""
+    ok, why = can_merge_reductions(program, first, second)
+    if not ok:
+        raise ValueError(f"cannot merge_reductions: {why}")
+    new = clone_program(program)
+    A = new._clone_map[id(first)]
+    B = new._clone_map[id(second)]
+    scope = _scope_of(new, A)
+    body = scope[-1].body
+
+    fused = ReductionLoop(A.axis, A.tile, A.body + B.body,
+                          partials=A.partials + B.partials)
+
+    # both loop nodes are replaced by `fused`, so consumers of EITHER loop's
+    # Value must rebind to that loop's first partial (its Value result).
+    for loop_node in (A, B):
+        val = loop_node.partials[0]
+        for c in _consumers(new, loop_node):
+            if isinstance(c, Compute):
+                c.inputs = [val if i is loop_node else i for i in c.inputs]
+            elif isinstance(c, Store):
+                if c.src is loop_node:
+                    c.src = val
+            elif isinstance(c, ReductionLoop):
+                c.partials = [val if p is loop_node else p for p in c.partials]
+                c.partial = c.partials[0] if c.partials else None
+
+    fi = _index_of(body, A)
+    body[fi:fi + 2] = [fused]
+    _strip_clone_meta(new)
+    # collapse loads now shared between the two reductions' bodies
+    return dedup_loads(new)

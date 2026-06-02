@@ -392,14 +392,17 @@ def p_extract_matmul():          # full loads OUTSIDE reduction, ct.extract per 
                                  [x, y, red, Store("c", red, ["n", "m"])])])
 
 
-def p_store_outside():           # inner->outer flow: Store consumes a tile made
-    # INSIDE a ReductionLoop (the bare Compute) rather than the loop's value.
+def p_inner_escape():            # genuine inner->outer flow: a NON-partial tile
+    # computed inside a ReductionLoop is consumed outside. (Storing the partial
+    # itself is now valid -- it equals the accumulator -- so the violation must
+    # use a non-accumulator inner value.)
     x, y = Load("x", ["n", "k"]), Load("y", ["k", "m"])
     mm = Compute("matmul", [x, y])
-    red = ReductionLoop("k", 32, [x, y, mm], mm)
+    r = Compute("relu", [mm])                # relu is NOT the accumulator
+    red = ReductionLoop("k", 32, [x, y, mm, r], mm)   # partial=mm; r is inner
     return Program({"x": (256, 128), "y": (128, 256), "c": (256, 256)},
                    [ParallelLoop("c", (64, 64), ("n", "m"),
-                                 [red, Store("c", mm, ["n", "m"])])])  # consumes mm, not red
+                                 [red, Store("c", r, ["n", "m"])])])  # consumes inner r
 
 
 def _np_softmax(s):
@@ -433,7 +436,7 @@ CASES = [
 
 # Programs that MUST be rejected by validate() (inner->outer flow).
 REJECT_CASES = [
-    ("store_outside", p_store_outside),       # Store consuming an inner-produced tile
+    ("inner_escape", p_inner_escape),     # non-partial inner tile consumed outside
 ]
 
 
@@ -651,6 +654,52 @@ def rewrite_checks(cp, is_gpu, refmath):
     three.tensors["z"] = (256, 256)
     reject_merge = not can_merge(three, t1, t2)[0]
     results.append(("merge_precondition", reject_merge, "shared-intermediate merge rejected"))
+
+    # --- merge_reductions: fuse two same-axis sibling reductions, dedup loads ---
+    from rewrites import merge_reductions, can_merge_reductions
+
+    def build_two_reductions():
+        # s1 = sum(x) over k ; s2 = sum(x*x) over k ; O = s1 + s2  (one kernel)
+        xa = Load("x", ["n", "k"]); s1 = Compute("rowsum", [xa], axis="k")
+        RL1 = ReductionLoop("k", 64, [xa, s1], s1)
+        xb = Load("x", ["n", "k"]); sq = Compute("mul", [xb, xb])
+        s2 = Compute("rowsum", [sq], axis="k")
+        RL2 = ReductionLoop("k", 64, [xb, sq, s2], s2)
+        comb = Compute("add", [RL1, RL2])
+        pl = ParallelLoop("O", (64, 1), ("n", "k"),
+                          [RL1, RL2, comb, Store("O", comb, ["n", "k"])])
+        return Program({"x": (128, 256), "O": (128, 1)}, [pl]), RL1, RL2
+
+    tr, RL1, RL2 = build_two_reductions()
+    r_unfused, _ = numeric(tr)
+    fused = merge_reductions(tr, RL1, RL2)
+    r_fused, src_fused = numeric(fused)
+    reds = [s for s in fused.body[0].body if isinstance(s, ReductionLoop)]
+    one_loop = len(reds) == 1 and len(reds[0].partials) == 2
+    one_load = src_fused.count("ct.load(x") == 1
+    ok = (np.allclose(r_unfused, r_fused, rtol=1e-3, atol=1e-3)
+          and one_loop and one_load)
+    results.append(("merge_reductions_equiv", ok,
+                    f"max|d|={float(np.max(np.abs(r_unfused - r_fused))):.1e}, "
+                    f"fused_loop={one_loop}, single_load={one_load}"))
+
+    # original untouched
+    results.append(("merge_reductions_no_mutation",
+                    len([s for s in tr.body[0].body if isinstance(s, ReductionLoop)]) == 2,
+                    "input tree still has two separate reductions"))
+
+    # precondition: dependent reductions (second reads first) cannot fuse
+    xa2 = Load("x", ["n", "k"]); m1 = Compute("rowmax", [xa2], axis="k")
+    D1 = ReductionLoop("k", 64, [xa2, m1], m1)
+    xb2 = Load("x", ["n", "k"]); sb = Compute("sub", [xb2, D1])   # depends on D1's result
+    e2 = Compute("exp", [sb]); s2b = Compute("rowsum", [e2], axis="k")
+    D2 = ReductionLoop("k", 64, [xb2, sb, e2, s2b], s2b)
+    dep = Program({"x": (128, 256), "O": (128, 1)},
+                  [ParallelLoop("O", (64, 1), ("n", "k"),
+                                [D1, D2, Store("O", D2, ["n", "k"])])])
+    reject_dep = not can_merge_reductions(dep, D1, D2)[0]
+    results.append(("merge_reductions_precondition", reject_dep,
+                    "dependent (second reads first) reduction-merge rejected"))
     return results
 
 

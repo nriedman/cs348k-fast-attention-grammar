@@ -80,7 +80,19 @@ class ReductionLoop(Stmt, Value):
     axis: str                      # reduced dimension's index name, e.g. "k"
     tile: int                      # tile size along `axis` (TS_<axis>, tunable)
     body: list[Stmt] = field(default_factory=list)
-    partial: Value = None          # the body Compute accumulated each iteration
+    partial: Value = None          # single-accumulator form (kept for back-compat)
+    partials: list = None          # multi-accumulator form: each is a Compute
+                                   # accumulated into its own accumulator. Fused
+                                   # reduction loops carry >1. If None, derived
+                                   # from `partial`.
+
+    def __post_init__(self):
+        # normalize: `partials` is the source of truth; `partial` mirrors the
+        # first (the loop's Value result for the single-accumulator case).
+        if self.partials is None:
+            self.partials = [self.partial] if self.partial is not None else []
+        if self.partial is None and self.partials:
+            self.partial = self.partials[0]
 
 
 @dataclass
@@ -254,15 +266,24 @@ class CuTileRenderer:
             return
         self.shapes[id(value)] = out_shape
         if isinstance(value, ReductionLoop):
-            # The accumulator (this loop's result) and its partial share this
-            # scope -- a SpatialLoop can't sit between them (validate() forbids
-            # SpatialLoop-in-ReductionLoop). Tile the contraction by `tile`.
-            self._infer(value.partial, out_shape, tensors, reduce_tile=value.tile)
+            # Each partial shares the loop's scope (no SpatialLoop between them).
+            # partials[0] is the loop's Value (seeded by out_shape); others are
+            # seeded through their own consumers -- here we ensure every partial
+            # is descended into with the contraction tiled by `tile`, using each
+            # partial's already-demanded shape when known.
+            for i, p in enumerate(value.partials):
+                pshape = self.shapes.get(id(p), out_shape if i == 0 else None)
+                if pshape is not None:
+                    self._infer(p, pshape, tensors, reduce_tile=value.tile)
         elif isinstance(value, Compute):
             operand_globals = [
                 tensors.get(i.source) if isinstance(i, Load) else None
                 for i in value.inputs
             ]
+            # if this Compute is a reduction partial, tile its contraction even
+            # when reached directly via its own consumer (not via the loop).
+            if reduce_tile is None:
+                reduce_tile = getattr(self, "_partial_tile", {}).get(id(value))
             if value.op in ROW_REDUCE_OPS:
                 # unary per-row reduction: out has a 1 on `value.axis`; the input
                 # restores that axis to full extent (or TS_<axis> if reducing).
@@ -480,7 +501,7 @@ def structural_key(node: Node, _memo: dict[int, tuple] | None = None) -> tuple:
     elif isinstance(node, ReductionLoop):
         key = ("ReductionLoop", node.axis, node.tile,
                tuple(structural_key(c, _memo) for c in node.body),
-               structural_key(node.partial, _memo))
+               tuple(structural_key(p, _memo) for p in node.partials))
     elif isinstance(node, SpatialLoop):
         key = ("SpatialLoop", node.axis, node.tile,
                tuple(structural_key(c, _memo) for c in node.body))
@@ -548,6 +569,19 @@ def _infer_program(program: Program) -> dict[int, Shape]:
     out of a reduction/spatial loop would be wrongly narrowed to the subtile."""
     r = CuTileRenderer()
     r._tensors = program.tensors
+    # map every reduction partial -> its loop's tile, so a partial reached via
+    # its own consumer (not via the loop) still tiles the contraction. Covers
+    # multi-accumulator fused loops where only partials[0] is the loop's Value.
+    r._partial_tile = {}
+    def collect(stmts):
+        for s in stmts:
+            if isinstance(s, (ReductionLoop, SpatialLoop)):
+                if isinstance(s, ReductionLoop):
+                    for p in s.partials:
+                        r._partial_tile[id(p)] = s.tile
+                collect(s.body)
+    for loop in program.body:
+        collect(loop.body)
     for loop in program.body:
         r._scope = set(loop.index_vars)
         r._seed_shapes(loop.body, loop, {})
@@ -584,7 +618,8 @@ def _loads_feeding(v: Value):
         for i in v.inputs:
             yield from _loads_feeding(i)
     elif isinstance(v, ReductionLoop):
-        yield from _loads_feeding(v.partial)
+        for p in v.partials:
+            yield from _loads_feeding(p)
 
 
 def _iter_loads(stmts):
@@ -664,9 +699,9 @@ def _emit_kernel(loop: ParallelLoop, tensors: dict[str, Shape],
         return out
 
     def reduction_extent(rl: ReductionLoop):
-        # the k-extent comes from any load feeding the partial that indexes `axis`
+        # the k-extent comes from any load feeding a partial that indexes `axis`
         # -- that load may sit OUTSIDE the loop (extracted in), so search inputs.
-        for ld in _loads_feeding(rl.partial):
+        for ld in _loads_feeding(rl):
             if rl.axis in ld.index:
                 return rl.axis.upper(), tensors[ld.source][ld.index.index(rl.axis)]
         for s in _iter_loads(rl.body):
@@ -716,8 +751,8 @@ def _emit_kernel(loop: ParallelLoop, tensors: dict[str, Shape],
                 out.append(f"{ind}{v} = ct.load({stmt.source}, {_tup(idx)}, {_tup(shp)})")
             elif isinstance(stmt, Compute):
                 args = [read(i, ind, out) for i in stmt.inputs]
-                if acc_for is not None and stmt is acc_for[0]:   # the accumulated partial
-                    _, acc = acc_for
+                if acc_for is not None and id(stmt) in acc_for:   # an accumulated partial
+                    acc = acc_for[id(stmt)]
                     if stmt.op not in REDUCE_RULES:
                         raise ValueError(
                             f"op {stmt.op!r} cannot be a reduction partial; "
@@ -742,17 +777,24 @@ def _emit_kernel(loop: ParallelLoop, tensors: dict[str, Shape],
                 # SpatialLoop enclosing the reduction). No SpatialLoop may live
                 # INSIDE -- enforced by validate() -- so it is never partially
                 # written; every iteration rebinds the whole tile.
-                acc = fresh("acc")
-                acc_shape = []
-                for d, vv in enumerate(loop.index_vars):
-                    dim = shapes[id(stmt)][d]
-                    if dim == 1:                     # collapsed axis (row-reduction)
-                        acc_shape.append("1")
-                    else:
-                        s = active_sub.get(vv, f"TS_{vv}")
-                        tiles[s] = dim; acc_shape.append(s)
-                init_fn = REDUCE_RULES[stmt.partial.op][0]
-                out.append(f"{ind}{acc} = {init_fn(_tup(acc_shape), f'{loop.out}.dtype')}")
+                # one accumulator per partial; independent partials share the
+                # loop's iteration. Each accumulator is the full output tile at
+                # this scope (narrowed by any enclosing SpatialLoop -- forbidden
+                # inside -- so never partially written; whole-tile rebind only).
+                acc_map = {}
+                for p in stmt.partials:
+                    acc = fresh("acc")
+                    acc_shape = []
+                    for d, vv in enumerate(loop.index_vars):
+                        dim = shapes[id(p)][d]
+                        if dim == 1:                     # collapsed axis (row-reduction)
+                            acc_shape.append("1")
+                        else:
+                            s = active_sub.get(vv, f"TS_{vv}")
+                            tiles[s] = dim; acc_shape.append(s)
+                    init_fn = REDUCE_RULES[p.op][0]
+                    out.append(f"{ind}{acc} = {init_fn(_tup(acc_shape), f'{loop.out}.dtype')}")
+                    acc_map[id(p)] = acc
                 k_sym, k_val = reduction_extent(stmt)
                 extents[k_sym] = k_val
                 ts_sym = f"TS_{stmt.axis}"; tiles[ts_sym] = stmt.tile
@@ -761,10 +803,10 @@ def _emit_kernel(loop: ParallelLoop, tensors: dict[str, Shape],
                 out.append(f"{ind}for {stmt.axis} in range(ct.cdiv({k_sym}, {ts_sym})):")
                 scope.add(stmt.axis)
                 frames.setdefault(stmt.axis, []).append((stmt.axis, ts_sym))
-                out += emit_stmts(stmt.body, ind + "    ", acc_for=(stmt.partial, acc))
+                out += emit_stmts(stmt.body, ind + "    ", acc_for=acc_map)
                 frames[stmt.axis].pop()
                 scope.discard(stmt.axis)
-                names[id(stmt)] = acc                    # the loop's result
+                names[id(stmt)] = acc_map[id(stmt.partials[0])]   # loop Value = first acc
                 mat_frames[id(stmt)] = snapshot()
             elif isinstance(stmt, SpatialLoop):
                 ts_sym = f"TS_{stmt.axis}"
@@ -955,12 +997,21 @@ def validate(program: Program) -> None:
         check_no_spatial(loop.body, False)
         scopes: dict[int, tuple] = {}
         depth_map(loop.body, (), scopes)
+        # partials are accumulators: their RESULT is available at their loop's
+        # scope (the renderer binds the accumulator name there), so a partial
+        # feeding a consumer outside its loop is the legal accumulator handoff.
+        partial_ids = set()
+        for s in _all_nodes(loop.body):
+            if isinstance(s, ReductionLoop):
+                partial_ids |= {id(p) for p in s.partials}
         for s in _all_nodes(loop.body):
             if isinstance(s, ReductionLoop):
                 continue          # partial lives inside by design (accumulator rebind)
             consumers = (s.inputs if isinstance(s, Compute)
                          else [s.src] if isinstance(s, Store) else [])
             for src in consumers:
+                if id(src) in partial_ids:
+                    continue       # accumulator handoff -- result is at loop scope
                 psc, csc = scopes.get(id(src)), scopes.get(id(s))
                 if psc is None or csc is None:
                     continue
