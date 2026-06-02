@@ -22,10 +22,12 @@ import argparse
 import json
 import math
 import os
+import re
 
 import matplotlib
 matplotlib.use("Agg")            # headless / no display needed
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MultipleLocator
 
 
 PENALTY_BASE = 1e9               # matches optimization.MEM_PENALTY_BASE
@@ -90,13 +92,14 @@ def plot_ablation(runs: dict, out_path: str):
         feasible = any(not math.isnan(y) for y in ys)
         any_feasible[label] = feasible
         if feasible:
-            ax.plot(its, ys, marker="o", ms=3, lw=1.8, label=label)
+            ax.plot(its, ys, marker="o", ms=3, lw=1.8, label=label, drawstyle="steps-post")
         else:
             # never reached a compilable kernel: draw a flat line at the top so it
             # reads as "pinned at infeasible" rather than vanishing.
             ax.plot(its, [float("nan")] * len(its), label=f"{label} (never feasible)")
     ax.set_xlabel("iteration")
     ax.set_ylabel("best feasible runtime (ms)")
+    ax.xaxis.set_major_locator(MultipleLocator(4))
     ax.set_yscale("log")
     ax.set_title("Design for Descent: reachable optimum by grammar property")
     ax.legend(fontsize=8)
@@ -109,15 +112,78 @@ def plot_ablation(runs: dict, out_path: str):
         print(f"  {label}: {note}")
 
 
+def load_tflops(run_dir: str):
+    """Read results/it*.json -> sorted list of (iteration, tflops) pairs."""
+    results_dir = os.path.join(run_dir, "results")
+    if not os.path.isdir(results_dir):
+        return []
+    pairs = []
+    for fname in os.listdir(results_dir):
+        m = re.fullmatch(r"it(\d+)\.json", fname)
+        if not m:
+            continue
+        iteration = int(m.group(1))
+        with open(os.path.join(results_dir, fname)) as f:
+            data = json.load(f)
+        tflops = data.get("stats", {}).get("tflops")
+        if tflops is not None:
+            pairs.append((iteration, float(tflops)))
+    pairs.sort()
+    return pairs
+
+
+def load_baseline_tflops(json_path: str):
+    """Return the tflops value from a baseline result JSON, or None if missing."""
+    try:
+        with open(json_path) as f:
+            data = json.load(f)
+        return float(data["stats"]["tflops"])
+    except (OSError, KeyError, ValueError):
+        return None
+
+
+def plot_tflops(runs: dict, out_path: str, plot_refs: bool):
+    """runs: {label: run_dir}. TFLOP/s at each benchmarked iteration, one line each."""
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    for label, rd in runs.items():
+        pairs = load_tflops(rd)
+        if not pairs:
+            print(f"  {label}: no results/ data found, skipping")
+            continue
+        its, tflops = zip(*pairs)
+        ax.plot(its, tflops, marker="o", ms=4, lw=1.8, label=label, drawstyle="steps-post")
+
+    # Baseline reference lines
+    if plot_refs:
+        _script_dir = os.path.dirname(os.path.abspath(__file__))
+        flash2 = load_baseline_tflops(os.path.join(_script_dir, "results", "flash2-sota.json"))
+        naive  = load_baseline_tflops(os.path.join(_script_dir, "results", "naive-pytorch.json"))
+        if flash2 is not None:
+            ax.axhline(flash2, color="black", lw=1.2, ls="--", label=f"FlashAttn2 ({flash2:.2f} TFLOP/s)")
+        if naive is not None:
+            ax.axhline(naive, color="gray", lw=1.2, ls=":", label=f"Naive PyTorch ({naive:.2f} TFLOP/s)")
+
+    ax.set_xlabel("iteration")
+    ax.set_ylabel("TFLOP/s")
+    ax.xaxis.set_major_locator(MultipleLocator(4))
+    ax.set_title("Kernel throughput improvmenet by grammar property")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    print(f"wrote {out_path}")
+
+
 def plot_flops_vs_runtime(run_dir: str, out_path: str):
     """For one run: FLOPs (flat) and runtime (dropping) over iterations."""
     recs = load_log(run_dir)
     its, ms, _ = current_loss_regime(recs)
     flops = [r.get("flops") for r in recs]
     fig, ax1 = plt.subplots(figsize=(7, 4.5))
-    ax1.plot(its, ms, color="tab:blue", marker="o", ms=3, lw=1.8, label="runtime (ms)")
+    ax1.plot(its, ms, color="tab:blue", marker="o", ms=3, lw=1.8, label="runtime (ms)", drawstyle="steps-post")
     ax1.set_xlabel("iteration")
     ax1.set_ylabel("runtime (ms)", color="tab:blue")
+    ax1.xaxis.set_major_locator(MultipleLocator(4))
     ax1.set_yscale("log")
     ax1.tick_params(axis="y", labelcolor="tab:blue")
     ax2 = ax1.twinx()
@@ -138,6 +204,7 @@ def main():
     ap.add_argument("--headline", default=None,
                     help="run_dir for the FLOPs-vs-runtime figure")
     ap.add_argument("--out-dir", default="figs")
+    ap.add_argument("--plot-refs", default=False)
     args = ap.parse_args()
 
     runs = {}
@@ -149,6 +216,7 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
     plot_ablation(runs, os.path.join(args.out_dir, "ablation.png"))
+    plot_tflops(runs, os.path.join(args.out_dir, "tflops.png"), args.plot_refs)
     if args.headline:
         plot_flops_vs_runtime(args.headline, os.path.join(args.out_dir, "flops_vs_runtime.png"))
 
