@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from kernel_ast import (
     Program, ParallelLoop, Load, Store, Compute, ReductionLoop, SpatialLoop,
-    Value, Stmt, REDUCE_RULES, _value_axes, _loads_feeding,
+    Value, Stmt, REDUCE_RULES, _value_axes, _loads_feeding, _iter_loads,
 )
 
 
@@ -364,3 +364,155 @@ def unwrap_reduction(program: Program, loop: ReductionLoop) -> Program:
                 c.partial = ccomp
     _strip_clone_meta(new)
     return new
+
+
+# ==========================================================================
+# STEP 1 -- explicit cross-stage data dependencies.
+#
+# The dependency between ParallelLoop stages is otherwise implicit: stage B
+# "depends on" stage A only because B contains a Load whose source equals A's
+# `out`. These helpers compute that graph as a first-class object the fusion
+# rewrites query, without adding stored fields to the AST (consistent with the
+# "derive the tensor/tile contract, don't store it" decision).
+# ==========================================================================
+def stage_inputs(loop: ParallelLoop) -> set:
+    """Tensor names this stage reads (its Load sources)."""
+    return {ld.source for ld in _iter_loads(loop.body)}
+
+
+def stage_output(loop: ParallelLoop) -> str:
+    """Tensor name this stage writes."""
+    return loop.out
+
+
+def stage_deps(program: Program) -> dict:
+    """id(stage) -> set of ids of EARLIER stages whose output this stage reads.
+    The explicit cross-stage edges: an edge A->B exists iff A.out in B's
+    inputs and A precedes B."""
+    deps: dict = {}
+    for i, b in enumerate(program.body):
+        ins = stage_inputs(b)
+        deps[id(b)] = {id(a) for a in program.body[:i] if stage_output(a) in ins}
+    return deps
+
+
+def _stage_index(program: Program, loop: ParallelLoop) -> int:
+    for i, b in enumerate(program.body):
+        if b is loop:
+            return i
+    return -1
+
+
+def _tensor_consumers(program: Program, name: str) -> list:
+    """Stages that read tensor `name` (it appears among their Load sources)."""
+    return [b for b in program.body if name in stage_inputs(b)]
+
+
+# ==========================================================================
+# STEP 2 -- Merge two ParallelLoop stages.
+#
+# Fuse producer A (writes tensor `d`) and consumer B (reads `d`) into one
+# kernel, eliminating the global round-trip of `d`: the tile A's Store would
+# have written is handed directly to where B's Load would have read it. This is
+# the "demote a TENSOR edge to a TILE edge" operation -- the named cross-stage
+# tensor `d` becomes an unnamed in-scope tile reference.
+#
+# Step 3's EliminateRoundTrip is folded in here: dropping the Store->Load pair
+# that crossed global memory IS the core of this transform.
+# ==========================================================================
+def can_merge(program: Program, producer: ParallelLoop,
+              consumer: ParallelLoop) -> tuple:
+    """Legal iff: producer immediately precedes consumer; consumer reads the
+    producer's output tensor `d`; `d` is consumed by no other stage and is not a
+    program output; and the two stages share identical index_vars and tile_shape
+    (one grid covers both). Returns (ok, reason)."""
+    ia, ib = _stage_index(program, producer), _stage_index(program, consumer)
+    if ia < 0 or ib < 0:
+        return False, "producer or consumer not found in program"
+    if ib != ia + 1:
+        return False, "stages are not adjacent (producer immediately before consumer)"
+    d = producer.out
+    if d not in stage_inputs(consumer):
+        return False, f"consumer does not read producer's output {d!r}"
+    # `d` must be a pure intermediate consumed only by this consumer.
+    others = [b for b in _tensor_consumers(program, d) if b is not consumer]
+    if others:
+        return False, f"tensor {d!r} is also read by another stage"
+    _, _, outputs = _program_io_names(program)
+    if d in outputs:
+        return False, f"tensor {d!r} is a program output (cannot be dropped)"
+    # iteration structure must match so one grid covers both stages
+    if tuple(producer.index_vars) != tuple(consumer.index_vars):
+        return False, "stages have different index_vars"
+    if tuple(producer.tile_shape) != tuple(consumer.tile_shape):
+        return False, "stages have different tile_shape"
+    # producer must write `d` exactly once, as a top-level Store of a single tile
+    pstores = [s for s in producer.body if isinstance(s, Store) and s.dest == d]
+    if len(pstores) != 1:
+        return False, f"producer does not write {d!r} with a single top-level Store"
+    # consumer must read `d` with loads whose index matches the store's index
+    cloads = [ld for ld in _iter_loads(consumer.body) if ld.source == d]
+    if not cloads:
+        return False, f"consumer has no Load of {d!r}"
+    store_idx = pstores[0].index
+    for ld in cloads:
+        if ld.index != store_idx:
+            return False, (f"consumer Load index {ld.index} != producer Store "
+                           f"index {store_idx} for {d!r} (mismatched tiling)")
+    return True, ""
+
+
+def merge(program: Program, producer: ParallelLoop,
+          consumer: ParallelLoop) -> Program:
+    """Return a new program with `producer` and `consumer` fused into one
+    ParallelLoop, the intermediate tensor `d` eliminated, and `d`'s loads in the
+    consumer rebound to the producer's stored tile."""
+    ok, why = can_merge(program, producer, consumer)
+    if not ok:
+        raise ValueError(f"cannot merge: {why}")
+    new = clone_program(program)
+    A = new._clone_map[id(producer)]
+    B = new._clone_map[id(consumer)]
+    d = A.out
+
+    # the producer's Store of `d` and the tile it stored
+    a_store = next(s for s in A.body if isinstance(s, Store) and s.dest == d)
+    handoff = a_store.src                       # the tile to pipe directly into B
+
+    # consumer's Load(s) of `d` -> rebind their consumers to `handoff`
+    d_loads = [ld for ld in _iter_loads(B.body) if ld.source == d]
+    for ld in d_loads:
+        for c in _consumers(new, ld):
+            if isinstance(c, Compute):
+                c.inputs = [handoff if i is ld else i for i in c.inputs]
+            elif isinstance(c, Store):
+                if c.src is ld:
+                    c.src = handoff
+            elif isinstance(c, ReductionLoop):
+                if c.partial is ld:
+                    c.partial = handoff
+
+    # build the fused body: producer's body minus its Store of `d`, then
+    # consumer's body minus its now-dead Load(s) of `d`.
+    a_body = [s for s in A.body if s is not a_store]
+    b_body = [s for s in B.body if not (isinstance(s, Load) and s in d_loads)]
+    fused = ParallelLoop(B.out, tuple(B.tile_shape), tuple(B.index_vars),
+                         a_body + b_body)
+
+    # splice: replace the A..B pair with the fused stage; drop `d` from tensors.
+    ia = _stage_index(new, A)
+    new.body[ia:ia + 2] = [fused]
+    new.tensors.pop(d, None)
+    _strip_clone_meta(new)
+    return new
+
+
+def _program_io_names(program: Program):
+    """(inputs, intermediates, outputs) tensor-name lists -- mirror of
+    kernel_ast._program_io but local to the rewrite layer."""
+    written, read = set(), set()
+    for loop in program.body:
+        written.add(loop.out)
+        for ld in _iter_loads(loop.body):
+            read.add(ld.source)
+    return (sorted(read - written), sorted(written & read), sorted(written - read))

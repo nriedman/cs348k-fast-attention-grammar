@@ -86,8 +86,8 @@ def _install_cpu_mock() -> None:
     ct.maximum = lambda x, y: np.maximum(x, y)
     ct.exp = lambda x: np.exp(x)
     ct.full = lambda shape, v, dtype=np.float32: np.full(shape, v, dtype=dtype)
-    ct.max = lambda x, axis: np.max(x, axis=axis, keepdims=True)   # row reduction
-    ct.sum = lambda x, axis: np.sum(x, axis=axis, keepdims=True)
+    ct.max = lambda x, axis, keepdims=False: np.max(x, axis=axis, keepdims=keepdims)
+    ct.sum = lambda x, axis, keepdims=False: np.sum(x, axis=axis, keepdims=keepdims)
     ct.cdiv = lambda a, b: -(-a // b)
 
     def _launch(stream, grid, kern, args):
@@ -615,6 +615,42 @@ def rewrite_checks(cp, is_gpu, refmath):
     rl3 = next(s for s in wrapped2.body[0].body if isinstance(s, ReductionLoop))
     reject = not can_unwrap_reduction(wrapped2, rl3)[0]
     results.append(("unwrap_precondition", reject, "non-bare reduction body rejected"))
+
+    # --- Merge: fuse matmul -> add into one kernel; drop the intermediate ---
+    from rewrites import merge, can_merge
+
+    def build_two_stage():
+        x, y = Load("x", ["n", "k"]), Load("y", ["k", "m"])
+        mm = Compute("matmul", [x, y])
+        s1 = ParallelLoop("a", (64, 64), ("n", "m"), [x, y, mm, Store("a", mm, ["n", "m"])])
+        a2, b2 = Load("a", ["n", "m"]), Load("b", ["n", "m"])
+        add = Compute("add", [a2, b2])
+        s2 = ParallelLoop("o", (64, 64), ("n", "m"), [a2, b2, add, Store("o", add, ["n", "m"])])
+        return Program({"x": (256, 128), "y": (128, 256), "b": (256, 256),
+                        "a": (256, 256), "o": (256, 256)}, [s1, s2]), s1, s2
+
+    two, s1, s2 = build_two_stage()
+    r_unfused, _ = numeric(two)
+    fused = merge(two, s1, s2)
+    r_fused, src_fused = numeric(fused)
+    ok = (np.allclose(r_unfused, r_fused, rtol=1e-3, atol=1e-3)
+          and len(fused.body) == 1 and "a" not in fused.tensors)
+    results.append(("merge_equiv", ok,
+                    f"max|d|={float(np.max(np.abs(r_unfused - r_fused))):.1e}, "
+                    f"stages={len(fused.body)}, dropped_a={'a' not in fused.tensors}"))
+
+    # original untouched
+    results.append(("merge_no_mutation", len(two.body) == 2 and "a" in two.tensors,
+                    "input tree still has two stages and the intermediate"))
+
+    # precondition: cannot merge when the intermediate is read elsewhere
+    three, t1, t2 = build_two_stage()
+    a3 = Load("a", ["n", "m"]); r3 = Compute("relu", [a3])
+    three.body.append(ParallelLoop("z", (64, 64), ("n", "m"),
+                                   [a3, r3, Store("z", r3, ["n", "m"])]))
+    three.tensors["z"] = (256, 256)
+    reject_merge = not can_merge(three, t1, t2)[0]
+    results.append(("merge_precondition", reject_merge, "shared-intermediate merge rejected"))
     return results
 
 
