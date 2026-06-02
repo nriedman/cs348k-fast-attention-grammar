@@ -5,13 +5,13 @@ import numpy as np
 ConstInt = ct.Constant[int]
 
 # --- tunable tile sizes (vary these to autotune) ---
-TILE_S = (32, 16)
-TILE_Ss = (16, 512)
+TILE_S = (32, 32)
+TILE_Ss = (32, 512)
 TILE_mx = (16, 512)
 TILE_sb = (16, 512)
-TILE_e = (16, 512)
+TILE_e = (32, 512)
 TILE_sm = (16, 512)
-TILE_P = (16, 512)
+TILE_P = (16, 128)
 TILE_O = (16, 16)
 RTILE_O = 32   # reduction tile along j
 
@@ -66,13 +66,13 @@ def sm_kernel(e, sm, J: ConstInt, TS_i: ConstInt):
     ct.store(sm, (i, 0), t2)
 
 @ct.kernel
-def P_kernel(e, sm, P, J: ConstInt, TS_i: ConstInt):
+def P_kernel(e, sm, P, TS_i: ConstInt, TS_j: ConstInt):
     i = ct.bid(0)
     j = ct.bid(1)
-    t1 = ct.load(e, (i, 0), (TS_i, J))
+    t1 = ct.load(e, (i, j), (TS_i, TS_j))
     t2 = ct.load(sm, (i, 0), (TS_i, 1))
     t3 = (t1 / t2)
-    ct.store(P, (i, 0), t3)
+    ct.store(P, (i, j), t3)
 
 @ct.kernel
 def O_kernel(P, V, O, J: ConstInt, TS_i: ConstInt, TS_dd: ConstInt, TS_j: ConstInt):
@@ -111,7 +111,7 @@ def fn(KT, Q, V):
     grid = (ct.cdiv(sm.shape[0], TILE_sm[0]), ct.cdiv(sm.shape[1], TILE_sm[1]), 1)
     ct.launch(stream, grid, sm_kernel, (e, sm, 512, TILE_sm[0]))
     grid = (ct.cdiv(P.shape[0], TILE_P[0]), ct.cdiv(P.shape[1], TILE_P[1]), 1)
-    ct.launch(stream, grid, P_kernel, (e, sm, P, 512, TILE_P[0]))
+    ct.launch(stream, grid, P_kernel, (e, sm, P, TILE_P[0], TILE_P[1]))
     grid = (ct.cdiv(O.shape[0], TILE_O[0]), ct.cdiv(O.shape[1], TILE_O[1]), 1)
     ct.launch(stream, grid, O_kernel, (P, V, O, 512, TILE_O[0], TILE_O[1], RTILE_O))
     return O

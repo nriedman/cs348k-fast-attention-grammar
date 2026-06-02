@@ -110,6 +110,30 @@ class EvalConfig:
                                         # passes the d=64 QK matmul but catches the
                                         # j=512 O matmul and softmax-row fusions; the
                                         # repair is to sub-tile. 0 disables.
+    repairable: bool = True             # REPAIRABILITY (Design-for-Descent). When True,
+                                        # the memory-footprint check is a SOFT, graded
+                                        # penalty: the search may apply a rewrite whose
+                                        # result is over budget and the tile-tuning
+                                        # projection (the Stage-1 sweep) pulls it back
+                                        # to feasible -- "bending the rule, then
+                                        # repairing". When False, the memory check is a
+                                        # HARD precondition: a Stage-2 rewrite whose
+                                        # result is over budget at its inherited tiles
+                                        # is rejected before any repair sweep, so the
+                                        # search can never step through infeasible
+                                        # territory to reach a fused kernel on the far
+                                        # side. (Ablates ONLY the memory constraint;
+                                        # compile-risk stays a hard precondition either
+                                        # way, for speed.)
+    reduction_tile_default: int = 32    # JUMP CONTINUITY (Design-for-Descent). The tile
+                                        # a freshly-created ReductionLoop (from
+                                        # subtile_reduction) starts at, clamped to the
+                                        # axis extent. A LARGE default keeps the post-
+                                        # rewrite shape close to the pre-rewrite one (a
+                                        # small instantaneous change -> jump-continuous);
+                                        # a SMALL default makes the rewrite a large jump.
+                                        # 32 is the neutral middle; principle_config sets
+                                        # 128 (jump-continuous) vs 16 (ablated).
 
 
 class Evaluator:
@@ -575,8 +599,12 @@ def _mk(kind, label, program, *nodes, **kw):
             if kind == "subtile":
                 c, = targets
                 ax = kw["axis"]
-                return (R.subtile_reduction(prog, c, ax)
-                        if R.can_subtile_reduction(prog, c, ax)[0] else None)
+                rtile = kw.get("reduction_tile")
+                if not R.can_subtile_reduction(prog, c, ax)[0]:
+                    return None
+                if rtile is not None:
+                    return R.subtile_reduction(prog, c, ax, tile=rtile)
+                return R.subtile_reduction(prog, c, ax)
             if kind == "unwrap":
                 rl, = targets
                 return (R.unwrap_reduction(prog, rl)
@@ -604,7 +632,9 @@ def _risk_excess(program: Program, threshold: int) -> int:
     return sum(max(0, r - threshold) for r in kernel_compile_risk(program))
 
 
-def enumerate_rewrites(program: Program, rules, max_risk: int = 0) -> list:
+def enumerate_rewrites(program: Program, rules, max_risk: int = 0,
+                       reduction_tile: int | None = None,
+                       mem_precondition: int = 0) -> list:
     """Every applicable rewrite as a path-addressed Rewrite descriptor (its
     precondition currently holds).
 
@@ -613,13 +643,20 @@ def enumerate_rewrites(program: Program, rules, max_risk: int = 0) -> list:
     not reduce the program's risk-excess. Because compile-risk is TILE-INVARIANT
     (it is set by global axis extents and loop structure, not tile sizes), no
     Stage-1 tuning could rescue such a result -- it would just be penalised -- so
-    excluding it is lossless and stops it from wasting a sampled rewrite slot. (The
-    MEMORY check is deliberately NOT folded in: it is tile-DEPENDENT, so an
-    over-budget result can be repaired by the sweep shrinking tiles, and dropping
-    it pre-sweep would lose rewrites the search could fix.) Risk-excess is compared
-    as a SUM (per the memory-penalty rationale): a rewrite is kept if its result is
-    risk-clean OR strictly reduces the excess, so fixing one of several risky stages
-    is never blocked."""
+    excluding it is lossless and stops it from wasting a sampled rewrite slot.
+    Risk-excess is compared as a SUM: a rewrite is kept if its result is risk-clean
+    OR strictly reduces the excess, so fixing one of several risky stages is never
+    blocked.
+
+    `reduction_tile` sets the tile a freshly-created subtile_reduction loop starts
+    at (the JUMP-CONTINUITY knob); None -> the rewrite's own default.
+
+    `mem_precondition` > 0 folds the MEMORY check in as a hard precondition too:
+    a rewrite whose result exceeds this budget AT ITS INHERITED TILES is dropped.
+    This is the REPAIRABILITY ablation -- normally the memory check is left soft
+    (a graded penalty the tile-tuning projection repairs), so it is NOT a
+    precondition; setting mem_precondition makes it hard, so the search cannot bend
+    the memory rule and rely on repair. 0 -> soft (repairable), the default."""
     out = []
     all_stmts = [s for loop in program.body for s in _iter_stmts(loop.body)]
 
@@ -642,7 +679,8 @@ def enumerate_rewrites(program: Program, rules, max_risk: int = 0) -> list:
                 for ax in R._contraction_axes(s):
                     if R.can_subtile_reduction(program, s, ax)[0]:
                         out.append(_mk("subtile", f"subtile({s.op},{ax})",
-                                       program, s, axis=ax))
+                                       program, s, axis=ax,
+                                       reduction_tile=reduction_tile))
     if "unwrap_reduction" in rules:
         for s in all_stmts:
             if isinstance(s, ReductionLoop) and R.can_unwrap_reduction(program, s)[0]:
@@ -668,19 +706,27 @@ def enumerate_rewrites(program: Program, rules, max_risk: int = 0) -> list:
                 if R.can_reorder(program, a, b)[0]:
                     out.append(_mk("reorder", "reorder(stmt)", program, a, b))
 
-    # COMPILE-RISK precondition (tile-invariant -> safe to filter pre-tuning).
-    if max_risk:
-        cur_excess = _risk_excess(program, max_risk)
-        live = []
-        for rw in out:
-            cand = rw.resolve(program)
-            if cand is None:
-                continue
+    # PRECONDITION FILTERS. Compile-risk (tile-invariant) is always applied when
+    # max_risk is set. Memory (tile-dependent) is applied ONLY when mem_precondition
+    # is set -- the repairability ablation; otherwise memory is left soft (a graded
+    # penalty the tile sweep repairs).
+    if not (max_risk or mem_precondition):
+        return out
+    cur_excess = _risk_excess(program, max_risk)
+    live = []
+    for rw in out:
+        cand = rw.resolve(program)
+        if cand is None:
+            continue
+        if max_risk:
             cand_excess = _risk_excess(cand, max_risk)
-            if cand_excess == 0 or cand_excess < cur_excess:
-                live.append(rw)          # risk-clean, or makes progress on the excess
-        return live
-    return out
+            if not (cand_excess == 0 or cand_excess < cur_excess):
+                continue                 # compile-risky and not reducing the excess
+        if mem_precondition:
+            if peak_tile_bytes(cand) > mem_precondition:
+                continue                 # over budget at inherited tiles, no repair
+        live.append(rw)
+    return live
 
 
 def stage2_step(program: Program, ev: Evaluator, K: int, rules, rng: random.Random,
@@ -705,7 +751,10 @@ def stage2_step(program: Program, ev: Evaluator, K: int, rules, rng: random.Rand
     ev.ctx = f"it {it} | S2 base-tune"
     cur_loss = stage1_sweep(prog, ev, ladder, couple, neighbor=True)[1]
     for d in range(max(1, depth)):
-        menu = enumerate_rewrites(prog, rules, ev.cfg.max_compile_risk)
+        menu = enumerate_rewrites(
+            prog, rules, ev.cfg.max_compile_risk,
+            reduction_tile=ev.cfg.reduction_tile_default,
+            mem_precondition=(0 if ev.cfg.repairable else ev.cfg.mem_budget))
         if not menu:
             break
         sample = rng.sample(menu, min(K, len(menu)))

@@ -5,12 +5,12 @@ import numpy as np
 ConstInt = ct.Constant[int]
 
 # --- tunable tile sizes (vary these to autotune) ---
-TILE_S = (32, 16)
+TILE_S = (16, 16)
 TILE_Ss = (16, 512)
 TILE_mx = (16, 512)
 TILE_sb = (16, 512)
 TILE_e = (16, 512)
-TILE_sm = (16, 512)
+TILE_sm = (32, 512)
 TILE_P = (16, 512)
 TILE_O = (16, 16)
 RTILE_O = 32   # reduction tile along j

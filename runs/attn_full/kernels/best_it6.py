@@ -5,7 +5,7 @@ import numpy as np
 ConstInt = ct.Constant[int]
 
 # --- tunable tile sizes (vary these to autotune) ---
-TILE_S = (32, 16)
+TILE_S = (32, 32)
 TILE_Ss = (16, 512)
 TILE_mx = (16, 512)
 TILE_sb = (16, 512)

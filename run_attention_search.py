@@ -128,32 +128,42 @@ def describe(program: Program) -> str:
 #                     so the constraint is actually violated and cannot be fixed.
 #   jump_continuity-> coarsen the tile ladder to a single rung, so every parameter
 #                     move is a large jump rather than a small step.
-#   local_control  -> couple all tile knobs into one global size, so no stage can
-#                     be tiled independently of the others.
-# Leave-one-out from the full grammar. Every config shares the SAME start (set by
-# the CLI tiling flags); for a clean single-variable ablation, run them all from
-# the atomic start (no --subtile-k/--tile) so the only difference is the property
-# removed. The atomic start already violates the memory budget, which is exactly
-# what the repairability ablation needs.
+# Design-for-Descent ablations. Leave-one-out from the full grammar; every config
+# shares the same atomic start, so the only difference is the property removed.
+#   reversibility   -> drop the inverse rewrites (unwrap_reduction, hoist).
+#   jump_continuity -> a new reduction loop starts at the SMALLEST tile (16, a large
+#                      jump from the pre-rewrite full-extent shape) instead of the
+#                      LARGEST (128, a small, near-continuous change).
+#   local_control   -> couple all tile knobs into one global size.
+#   repairability   -> make the memory check a HARD precondition (reject over-budget
+#                      rewrites) instead of a soft, repairable penalty.
 FULL_RULES = ("hoist", "sink", "subtile_reduction", "unwrap_reduction",
               "merge", "merge_reductions", "reorder")
+NO_INVERSE_RULES = ("subtile_reduction", "sink", "merge", "merge_reductions", "reorder")
+JUMP_CONTINUOUS_TILE = 128             # largest standard rung: post-rewrite shape ~ unchanged
+JUMP_DISCONTINUOUS_TILE = 16           # smallest rung: post-rewrite shape jumps far
 
 
-def principle_config(principle: str):
-    """Return (rules, tile_ladder, couple_tiles) for an ablation."""
+def principle_config(principle: str) -> dict:
+    """Per-principle settings. Returns a dict consumed by main(): rules + the two
+    parameter-space knobs (tile_ladder, couple_tiles) + the two evaluator knobs
+    (repairable, reduction_tile). Defaults are the 'full' (all properties present)
+    config; each ablation flips exactly one."""
+    cfg = dict(rules=FULL_RULES, tile_ladder=None, couple_tiles=False,
+               repairable=True, reduction_tile=JUMP_CONTINUOUS_TILE)
     if principle == "full":
-        return FULL_RULES, None, False
-    if principle == "no_reversibility":           # drop inverse rewrites
-        return ("subtile_reduction", "sink", "merge", "merge_reductions", "reorder"), \
-               None, False
-    if principle == "no_repairability":           # drop subtile_reduction, the repair rule
-        return ("hoist", "sink", "unwrap_reduction", "merge", "merge_reductions", "reorder"), \
-               None, False
-    if principle == "no_jump_continuity":         # coarse ladder (single rung)
-        return FULL_RULES, (16,), False
-    if principle == "no_local_control":           # couple all tiles
-        return FULL_RULES, None, True
-    raise ValueError(f"unknown principle {principle!r}")
+        return cfg
+    if principle == "no_reversibility":
+        cfg["rules"] = NO_INVERSE_RULES
+    elif principle == "no_repairability":
+        cfg["repairable"] = False
+    elif principle == "no_jump_continuity":
+        cfg["reduction_tile"] = JUMP_DISCONTINUOUS_TILE
+    elif principle == "no_local_control":
+        cfg["couple_tiles"] = True
+    else:
+        raise ValueError(f"unknown principle {principle!r}")
+    return cfg
 
 
 def verify(program: Program, N: int, d: int) -> bool:
@@ -217,7 +227,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    rules, ladder, couple = principle_config(args.principle)
+    pc = principle_config(args.principle)
     # the start is whatever the CLI tiling flags specify. For a clean ablation run
     # all principles from the SAME start -- ideally atomic (no --subtile-k/--tile),
     # which already violates the budget (so repairability is genuinely tested) and
@@ -227,12 +237,15 @@ def main():
                               proxy=args.proxy, seed=args.seed, log=args.log,
                               mem_budget=args.mem_budget_kb * 1024,
                               compile_timeout=args.compile_timeout,
-                              max_compile_risk=args.max_compile_risk))
+                              max_compile_risk=args.max_compile_risk,
+                              repairable=pc["repairable"],
+                              reduction_tile_default=pc["reduction_tile"]))
 
     print(f"task: scaled dot-product attention   Q[{args.n},{args.d}] "
           f"K[{args.n},{args.d}] V[{args.n},{args.d}]  fp32")
-    print(f"ablation: {args.principle}  (rules={rules}, ladder={ladder or 'fine'}, "
-          f"couple_tiles={couple})")
+    print(f"ablation: {args.principle}  (rules={pc['rules']}, "
+          f"ladder={pc['tile_ladder'] or 'fine'}, couple_tiles={pc['couple_tiles']}, "
+          f"repairable={pc['repairable']}, reduction_tile={pc['reduction_tile']})")
     print(f"start: {describe(prog)}")
     if args.tile is None and not args.proxy:
         print("note: atomic start -> the search must DISCOVER tiling. Over-budget "
@@ -243,7 +256,8 @@ def main():
 
     best = autotune(prog, ev, SearchConfig(
         iters=args.iters, N=args.every, K=args.k, depth=args.depth, seed=args.seed,
-        verbose=True, rules=rules, tile_ladder=ladder, couple_tiles=couple,
+        verbose=True, rules=pc["rules"], tile_ladder=pc["tile_ladder"],
+        couple_tiles=pc["couple_tiles"],
         run_dir=args.run_dir, resume=args.resume))
 
     best_loss = ev(best)

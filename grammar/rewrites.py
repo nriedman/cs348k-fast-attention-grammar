@@ -303,6 +303,13 @@ def subtile_reduction(program: Program, compute: Compute, axis: str,
     scope = _scope_of(new, ccomp)
     body = scope[-1].body                       # body that directly holds ccomp
 
+    # clamp the requested tile to the axis's global extent: a tile wider than the
+    # axis would emit an out-of-range loop. (Lets callers pass a policy like "the
+    # largest rung" without knowing each axis's extent.)
+    from .kernel_ast import _axis_global_extent
+    ext = _axis_global_extent(ccomp, axis, new.tensors)
+    tile = min(tile, ext)
+
     # wrap ONLY the compute; loads remain in place and are extracted from.
     red = ReductionLoop(axis, tile, [ccomp], ccomp)
     body[_index_of(body, ccomp)] = red
