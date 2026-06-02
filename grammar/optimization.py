@@ -107,8 +107,9 @@ class Evaluator:
             end.record(); end.synchronize()
             times.append(cp.cuda.get_elapsed_time(start, end))   # ms
         self._runs += 1
-        times.sort()
-        return times[len(times) // 2]       # median, to denoise
+        # minimum is the least scheduling-noise-contaminated sample for a
+        # throughput-bound kernel; median still drifts with system jitter.
+        return min(times)
 
 
 _MODULE_SEQ = [0]
@@ -243,23 +244,20 @@ def _reduction_extent(program: Program, rl: ReductionLoop) -> int:
 # to stay gradient-flavored). Tile dims interact, so we sweep all coordinates.
 # ==========================================================================
 def stage1_sweep(program: Program, ev: Evaluator) -> tuple[Program, float]:
-    """Mutates a CLONE of `program` in place via its parameter vector. Returns
-    (tuned_program, loss)."""
+    """One full coordinate sweep over tile parameters. For each tunable tile
+    dimension, evaluate EVERY rung on its ladder and keep the best. All-rungs
+    (not just adjacent) because the ladder is short (4-5 values), so it is cheap
+    and far more thorough: it escapes local bumps and an infeasible (inf) start
+    where the adjacent rung is also infeasible. Mutates a CLONE in place."""
     prog = R.clone_program(program)
     R._strip_clone_meta(prog)
     params = parameter_vector(prog)
     best = ev(prog)
     for p in params:
-        rungs = p.ladder()
-        i = rungs.index(p.current) if p.current in rungs else len(rungs) - 1
-        # adjacent-rung neighbors
-        cand = []
-        if i > 0:
-            cand.append(rungs[i - 1])
-        if i < len(rungs) - 1:
-            cand.append(rungs[i + 1])
         best_size, best_loss = p.current, best
-        for size in cand:
+        for size in p.ladder():
+            if size == p.current:
+                continue
             p.set(size)
             loss = ev(prog)
             if loss < best_loss:
@@ -284,17 +282,112 @@ def _iter_stmts(body):
             yield from _iter_stmts(s.body)
 
 
+# A rewrite is identified by a stable, tree-INDEPENDENT descriptor: the path(s)
+# to its target node(s) plus any scalar args. `resolve(prog)` finds the matching
+# nodes in `prog`, checks the precondition there, and applies -- returning the
+# new program, or None if it no longer applies. This is what lets the apply
+# phase land several rewrites per step: each is re-resolved against the evolving
+# clone rather than replayed via stale-node closures.
+def _path_of(program: Program, node) -> tuple | None:
+    """Stable address of `node`: (stage_index, (body_index, ...)) walking into
+    nested loop bodies. A ParallelLoop stage is (stage_index, ())."""
+    for si, loop in enumerate(program.body):
+        if loop is node:
+            return (si, ())
+        hit = _walk_path(loop.body, node, ())
+        if hit is not None:
+            return (si, hit)
+    return None
+
+
+def _walk_path(body, node, prefix):
+    for i, s in enumerate(body):
+        if s is node:
+            return prefix + (i,)
+        if isinstance(s, (ReductionLoop, SpatialLoop)):
+            hit = _walk_path(s.body, node, prefix + (i,))
+            if hit is not None:
+                return hit
+    return None
+
+
+def _at_path(program: Program, path: tuple):
+    """Inverse of _path_of: the node at (stage_index, (body_index, ...))."""
+    si, idxs = path
+    if si >= len(program.body):
+        return None
+    node = program.body[si]
+    body = node.body
+    for j, i in enumerate(idxs):
+        if i >= len(body):
+            return None
+        node = body[i]
+        if j < len(idxs) - 1:
+            if not isinstance(node, (ReductionLoop, SpatialLoop)):
+                return None
+            body = node.body
+    return node
+
+
+@dataclass
+class Rewrite:
+    """A re-resolvable structural move. `label` is for logging; `resolve` applies
+    it to a given program, returning the new program or None if inapplicable."""
+    label: str
+    resolve: object                      # callable: program -> program | None
+
+
+def _mk(kind, label, program, *nodes, **kw):
+    """Build a Rewrite whose targets are addressed by path (captured now from
+    `program`) and re-resolved at apply time against whatever tree is passed."""
+    paths = [_path_of(program, n) for n in nodes]
+
+    def resolve(prog, kind=kind, paths=paths, kw=kw):
+        targets = [_at_path(prog, p) for p in paths]
+        if any(t is None for t in targets):
+            return None
+        try:
+            if kind == "hoist":
+                ld, = targets
+                return R.hoist(prog, ld) if R.can_hoist(prog, ld)[0] else None
+            if kind == "sink":
+                ld, k = targets
+                return R.sink(prog, ld, k) if R.can_sink(prog, ld, k)[0] else None
+            if kind == "subtile":
+                c, = targets
+                ax = kw["axis"]
+                return (R.subtile_reduction(prog, c, ax)
+                        if R.can_subtile_reduction(prog, c, ax)[0] else None)
+            if kind == "unwrap":
+                rl, = targets
+                return (R.unwrap_reduction(prog, rl)
+                        if R.can_unwrap_reduction(prog, rl)[0] else None)
+            if kind == "merge":
+                a, b = targets
+                return R.merge(prog, a, b) if R.can_merge(prog, a, b)[0] else None
+            if kind == "merge_red":
+                a, b = targets
+                return (R.merge_reductions(prog, a, b)
+                        if R.can_merge_reductions(prog, a, b)[0] else None)
+            if kind == "reorder":
+                a, b = targets
+                return R.reorder(prog, a, b) if R.can_reorder(prog, a, b)[0] else None
+        except Exception:
+            return None
+        return None
+    return Rewrite(label, resolve)
+
+
 def enumerate_rewrites(program: Program, rules) -> list:
-    """Every (label, apply_callable) whose precondition currently holds. Each
-    apply_callable takes a program and returns a new program."""
+    """Every applicable rewrite as a path-addressed Rewrite descriptor (its
+    precondition currently holds)."""
     out = []
-    bodies = [(loop, loop.body) for loop in program.body]
-    all_stmts = [(loop, s) for loop in program.body for s in _iter_stmts(loop.body)]
+    all_stmts = [s for loop in program.body for s in _iter_stmts(loop.body)]
 
     if "hoist" in rules:
-        for loop, s in all_stmts:
+        for s in all_stmts:
             if isinstance(s, Load) and R.can_hoist(program, s)[0]:
-                out.append((f"hoist({s.source})", lambda p, s=s: R.hoist(p, s)))
+                out.append(_mk("hoist", f"hoist({s.source})", program, s))
     if "sink" in rules:
         for loop in program.body:
             loops_in = [x for x in _iter_stmts(loop.body)
@@ -303,75 +396,72 @@ def enumerate_rewrites(program: Program, rules) -> list:
                 if isinstance(s, Load):
                     for k in loops_in:
                         if R.can_sink(program, s, k)[0]:
-                            out.append((f"sink({s.source})",
-                                        lambda p, s=s, k=k: R.sink(p, s, k)))
+                            out.append(_mk("sink", f"sink({s.source})", program, s, k))
     if "subtile_reduction" in rules:
-        for loop, s in all_stmts:
+        for s in all_stmts:
             if isinstance(s, Compute):
                 for ax in R._contraction_axes(s):
                     if R.can_subtile_reduction(program, s, ax)[0]:
-                        out.append((f"subtile({s.op},{ax})",
-                                    lambda p, s=s, ax=ax: R.subtile_reduction(p, s, ax)))
+                        out.append(_mk("subtile", f"subtile({s.op},{ax})",
+                                       program, s, axis=ax))
     if "unwrap_reduction" in rules:
-        for loop, s in all_stmts:
+        for s in all_stmts:
             if isinstance(s, ReductionLoop) and R.can_unwrap_reduction(program, s)[0]:
-                out.append((f"unwrap({s.axis})", lambda p, s=s: R.unwrap_reduction(p, s)))
+                out.append(_mk("unwrap", f"unwrap({s.axis})", program, s))
     if "merge" in rules:
         for a, b in zip(program.body, program.body[1:]):
             if R.can_merge(program, a, b)[0]:
-                out.append((f"merge({a.out},{b.out})", lambda p, a=a, b=b: R.merge(p, a, b)))
+                out.append(_mk("merge", f"merge({a.out},{b.out})", program, a, b))
     if "merge_reductions" in rules:
         for loop in program.body:
             sibs = loop.body
             for a, b in zip(sibs, sibs[1:]):
                 if isinstance(a, ReductionLoop) and isinstance(b, ReductionLoop) \
                         and R.can_merge_reductions(program, a, b)[0]:
-                    out.append((f"merge_red({a.axis})",
-                                lambda p, a=a, b=b: R.merge_reductions(p, a, b)))
+                    out.append(_mk("merge_red", f"merge_red({a.axis})", program, a, b))
     if "reorder" in rules:
-        # adjacent stage pairs and adjacent statement pairs
         for a, b in zip(program.body, program.body[1:]):
             if R.can_reorder(program, a, b)[0]:
-                out.append((f"reorder({a.out},{b.out})",
-                            lambda p, a=a, b=b: R.reorder(p, a, b)))
+                out.append(_mk("reorder", f"reorder({a.out},{b.out})", program, a, b))
         for loop in program.body:
             sibs = loop.body
             for a, b in zip(sibs, sibs[1:]):
                 if R.can_reorder(program, a, b)[0]:
-                    out.append(("reorder(stmt)", lambda p, a=a, b=b: R.reorder(p, a, b)))
+                    out.append(_mk("reorder", "reorder(stmt)", program, a, b))
     return out
 
 
 def stage2_step(program: Program, ev: Evaluator, K: int, rules, rng: random.Random
                 ) -> tuple[Program, float, list]:
     """Sample K applicable rewrites, trial each (apply + one Stage-1 sweep),
-    accept all non-worsening, apply best-first re-checking preconditions."""
+    then apply all non-worsening best-first -- re-resolving each against the
+    evolving program and skipping any whose precondition no longer holds. Because
+    descriptors re-resolve (rather than replay stale-node closures), several
+    rewrites can land in one step."""
     base_loss = stage1_sweep(program, ev)[1]
     menu = enumerate_rewrites(program, rules)
     if not menu:
         return program, base_loss, []
     sample = rng.sample(menu, min(K, len(menu)))
 
-    trials = []                                  # (delta, label, apply_fn)
-    for label, apply_fn in sample:
-        try:
-            cand = apply_fn(program)
-        except Exception:
+    trials = []                                  # (delta, rewrite)
+    for rw in sample:
+        cand = rw.resolve(program)               # apply to a fresh clone
+        if cand is None:
             continue
-        _, loss = stage1_sweep(cand, ev)         # judge a structural move WITH a re-tune
+        _, loss = stage1_sweep(cand, ev)         # judge the move WITH a re-tune
         if loss <= base_loss:                    # accept non-worsening (enabling moves)
-            trials.append((base_loss - loss, label, apply_fn))
+            trials.append((base_loss - loss, rw))
 
     trials.sort(key=lambda t: -t[0])             # best improvement first
     applied = []
     prog = program
-    for delta, label, apply_fn in trials:
-        try:
-            cand = apply_fn(prog)                # re-check by re-applying on current prog
-        except Exception:
-            continue                             # precondition no longer holds
+    for delta, rw in trials:
+        cand = rw.resolve(prog)                  # re-resolve against current tree
+        if cand is None:
+            continue                             # precondition no longer holds here
         prog = cand
-        applied.append((label, delta))
+        applied.append((rw.label, delta))
     return prog, base_loss, applied
 
 

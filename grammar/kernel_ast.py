@@ -678,8 +678,13 @@ def _emit_kernel(loop: ParallelLoop, tensors: dict[str, Shape],
 
     def fresh(prefix: str = "t") -> str:
         nonlocal counter
-        counter += 1
-        return f"{prefix}{counter}"
+        # never collide with a tensor parameter name (e.g. an intermediate named
+        # "t1" would shadow a freshly-named load tile "t1", corrupting stores).
+        while True:
+            counter += 1
+            cand = f"{prefix}{counter}"
+            if cand not in targs:
+                return cand
 
     # active subtiling frames per axis (outer->inner), pushed by SpatialLoops and
     # the ReductionLoop. Each frame is (subtile_index_var, subtile_shape_sym).

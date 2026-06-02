@@ -435,8 +435,11 @@ def can_merge(program: Program, producer: ParallelLoop,
               consumer: ParallelLoop) -> tuple:
     """Legal iff: producer immediately precedes consumer; consumer reads the
     producer's output tensor `d`; `d` is consumed by no other stage and is not a
-    program output; and the two stages share identical index_vars and tile_shape
-    (one grid covers both). Returns (ok, reason)."""
+    program output; the two stages share the same index_vars; and the consumer
+    reads `d` at the same index the producer stored it. The fused stage runs the
+    producer's body at the CONSUMER's tile shape (the producer's own tiling is
+    erased -- its work is recomputed per consumer-tile), so the two tile_shapes
+    need NOT match. Returns (ok, reason)."""
     ia, ib = _stage_index(program, producer), _stage_index(program, consumer)
     if ia < 0 or ib < 0:
         return False, "producer or consumer not found in program"
@@ -452,16 +455,15 @@ def can_merge(program: Program, producer: ParallelLoop,
     _, _, outputs = _program_io_names(program)
     if d in outputs:
         return False, f"tensor {d!r} is a program output (cannot be dropped)"
-    # iteration structure must match so one grid covers both stages
+    # same iteration space (one grid covers both); tile sizes may differ.
     if tuple(producer.index_vars) != tuple(consumer.index_vars):
         return False, "stages have different index_vars"
-    if tuple(producer.tile_shape) != tuple(consumer.tile_shape):
-        return False, "stages have different tile_shape"
     # producer must write `d` exactly once, as a top-level Store of a single tile
     pstores = [s for s in producer.body if isinstance(s, Store) and s.dest == d]
     if len(pstores) != 1:
         return False, f"producer does not write {d!r} with a single top-level Store"
-    # consumer must read `d` with loads whose index matches the store's index
+    # consumer must read `d` with the same index it was stored at (same region),
+    # so the producer's tile can be handed directly to the consumer's use.
     cloads = [ld for ld in _iter_loads(consumer.body) if ld.source == d]
     if not cloads:
         return False, f"consumer has no Load of {d!r}"
@@ -469,7 +471,7 @@ def can_merge(program: Program, producer: ParallelLoop,
     for ld in cloads:
         if ld.index != store_idx:
             return False, (f"consumer Load index {ld.index} != producer Store "
-                           f"index {store_idx} for {d!r} (mismatched tiling)")
+                           f"index {store_idx} for {d!r} (mismatched region)")
     return True, ""
 
 

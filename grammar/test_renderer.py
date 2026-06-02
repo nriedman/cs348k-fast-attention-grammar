@@ -376,6 +376,21 @@ def p_fused_matmul_add():        # two stages: o = (x @ y) + b
                     "a": (256, 256), "o": (256, 256)}, [s1, s2])
 
 
+def p_tname_collision():         # tensors named like fresh tile vars (t1, t2)
+    # A two-stage chain whose tensors are named "t1"/"t2" -- the renderer's fresh
+    # tile names are also t1, t2, ...; without guarding, a loaded tile would
+    # shadow the store-destination param. Pins that fresh names never collide
+    # with a tensor (parameter) name.
+    a, b = Load("a", ["n", "m"]), Load("b", ["n", "m"])
+    add = Compute("add", [a, b])
+    s1 = ParallelLoop("t1", (64, 64), ("n", "m"), [a, b, add, Store("t1", add, ["n", "m"])])
+    t1, c = Load("t1", ["n", "m"]), Load("c", ["n", "m"])
+    mul = Compute("mul", [t1, c])
+    s2 = ParallelLoop("t2", (64, 64), ("n", "m"), [t1, c, mul, Store("t2", mul, ["n", "m"])])
+    return Program({"a": (256, 256), "b": (256, 256), "c": (256, 256),
+                    "t1": (256, 256), "t2": (256, 256)}, [s1, s2])
+
+
 def p_batched_4d_relu():         # 4-D output -> grid collapse/decode
     x = Load("x", ["b0", "b1", "n", "m"]); r = Compute("relu", [x])
     return Program({"x": (2, 4, 128, 128), "y": (2, 4, 128, 128)},
@@ -432,6 +447,7 @@ CASES = [
     Case("attention",           p_attention,           _attention_ref),
     Case("fused_matmul_add",    p_fused_matmul_add,    lambda M, i: M.add(M.matmul(i["x"], i["y"]), i["b"])),
     Case("batched_4d_relu",     p_batched_4d_relu,     lambda M, i: M.relu(i["x"])),
+    Case("tname_collision",     p_tname_collision,     lambda M, i: M.mul(M.add(i["a"], i["b"]), i["c"])),
 ]
 
 # Programs that MUST be rejected by validate() (inner->outer flow).
