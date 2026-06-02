@@ -35,11 +35,11 @@ import os
 import importlib.util
 from dataclasses import dataclass, field
 
-from kernel_ast import (
+from .kernel_ast import (
     Program, ParallelLoop, ReductionLoop, SpatialLoop, Load, Store, Compute,
     emit_module, structural_key, peak_tile_bytes,
 )
-import rewrites as R
+from . import rewrites as R
 
 
 # A penalised (over-memory-budget) program scores MEM_PENALTY_BASE + KB. The base
@@ -302,7 +302,7 @@ def _reduction_extent(program: Program, rl: ReductionLoop) -> int:
     for ld in R._loads_feeding(rl):
         if rl.axis in ld.index:
             return program.tensors[ld.source][ld.index.index(rl.axis)]
-    from kernel_ast import _iter_loads
+    from .kernel_ast import _iter_loads
     for ld in _iter_loads(rl.body):
         if rl.axis in ld.index:
             return program.tensors[ld.source][ld.index.index(rl.axis)]
