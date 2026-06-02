@@ -118,6 +118,44 @@ def describe(program: Program) -> str:
     return " -> ".join(f"{loop.out}{tuple(loop.tile_shape)}" for loop in program.body)
 
 
+# ---------------------------------------------------------------------------
+# Design-for-Descent ablation: each principle, when REMOVED, disables the grammar
+# feature that provides it. Leave-one-out from the full grammar.
+#   reversibility  -> drop the INVERSE rewrites (unwrap_reduction, hoist); the
+#                     search can build/repair but never undo a structural move.
+#   repairability  -> drop subtile_reduction, the only rule that repairs an
+#                     over-budget (full-K) matmul; combined with an ATOMIC start
+#                     so the constraint is actually violated and cannot be fixed.
+#   jump_continuity-> coarsen the tile ladder to a single rung, so every parameter
+#                     move is a large jump rather than a small step.
+#   local_control  -> couple all tile knobs into one global size, so no stage can
+#                     be tiled independently of the others.
+# Leave-one-out from the full grammar. Every config shares the SAME start (set by
+# the CLI tiling flags); for a clean single-variable ablation, run them all from
+# the atomic start (no --subtile-k/--tile) so the only difference is the property
+# removed. The atomic start already violates the memory budget, which is exactly
+# what the repairability ablation needs.
+FULL_RULES = ("hoist", "sink", "subtile_reduction", "unwrap_reduction",
+              "merge", "merge_reductions", "reorder")
+
+
+def principle_config(principle: str):
+    """Return (rules, tile_ladder, couple_tiles) for an ablation."""
+    if principle == "full":
+        return FULL_RULES, None, False
+    if principle == "no_reversibility":           # drop inverse rewrites
+        return ("subtile_reduction", "sink", "merge", "merge_reductions", "reorder"), \
+               None, False
+    if principle == "no_repairability":           # drop subtile_reduction, the repair rule
+        return ("hoist", "sink", "unwrap_reduction", "merge", "merge_reductions", "reorder"), \
+               None, False
+    if principle == "no_jump_continuity":         # coarse ladder (single rung)
+        return FULL_RULES, (16,), False
+    if principle == "no_local_control":           # couple all tiles
+        return FULL_RULES, None, True
+    raise ValueError(f"unknown principle {principle!r}")
+
+
 def verify(program: Program, N: int, d: int) -> bool:
     import cupy as cp
     from grammar.optimization import _import_source
@@ -143,8 +181,11 @@ def main():
                     help="pre-wrap matmuls in a K-loop of this tile (avoids the "
                          "slow full-K compile; recommended for the first run)")
     ap.add_argument("--iters", type=int, default=30)
-    ap.add_argument("--every", type=int, default=2, help="Stage-2 every N iters")
-    ap.add_argument("--k", type=int, default=8, help="rewrites sampled per Stage-2")
+    ap.add_argument("--every", type=int, default=4, help="Stage-2 every N iters; the "
+                    "N-1 neighbor Stage-1 sweeps between let tiles cross the ladder")
+    ap.add_argument("--k", type=int, default=5, help="rewrites sampled per Stage-2 step")
+    ap.add_argument("--depth", type=int, default=1, help="rewrites chained per Stage-2 "
+                    "step (1=one move; 2=a 2-step lookahead, ~2x the Stage-2 cost)")
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--proxy", action="store_true")
@@ -157,27 +198,45 @@ def main():
                     help="write analysis log + resume snapshots to this directory")
     ap.add_argument("--resume", action="store_true",
                     help="resume the search from <run-dir>/snapshot.pkl")
+    ap.add_argument("--principle", type=str, default="full",
+                    choices=["full", "no_reversibility", "no_repairability",
+                             "no_jump_continuity", "no_local_control"],
+                    help="Design-for-Descent ablation: which property to remove "
+                         "(leave-one-out from the full grammar). 'full' = all four.")
+    ap.add_argument("--compile-timeout", type=float, default=60.0, dest="compile_timeout",
+                    help="seconds; abandon (penalize) any single compile that exceeds "
+                         "this. Healthy compiles are a few seconds, so 45-60 cleanly "
+                         "catches ptxas-hostile fusions without touching good ones. "
+                         "0 disables.")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
+    rules, ladder, couple = principle_config(args.principle)
+    # the start is whatever the CLI tiling flags specify. For a clean ablation run
+    # all principles from the SAME start -- ideally atomic (no --subtile-k/--tile),
+    # which already violates the budget (so repairability is genuinely tested) and
+    # gives every property maximum room to matter.
     prog = build_attention(args.n, args.d, tile=args.tile, subtile_k=args.subtile_k)
     ev = Evaluator(EvalConfig(warmup=args.warmup, iters=args.reps,
                               proxy=args.proxy, seed=args.seed, log=args.log,
-                              mem_budget=args.mem_budget_kb * 1024))
+                              mem_budget=args.mem_budget_kb * 1024,
+                              compile_timeout=args.compile_timeout))
 
     print(f"task: scaled dot-product attention   Q[{args.n},{args.d}] "
           f"K[{args.n},{args.d}] V[{args.n},{args.d}]  fp32")
+    print(f"ablation: {args.principle}  (rules={rules}, ladder={ladder or 'fine'}, "
+          f"couple_tiles={couple})")
     print(f"start: {describe(prog)}")
     if args.tile is None and not args.proxy:
-        print("note: atomic start -> the first eval JIT-compiles full-extent "
-              "single-tile matmuls, which can be VERY slow to compile. If the "
-              "first eval hangs, start feasible with e.g. --tile 64.", flush=True)
+        print("note: atomic start -> the search must DISCOVER tiling. Over-budget "
+              "kernels are penalized (not compiled), so this won't hang.", flush=True)
     print("timing start program (compiling)...", flush=True)
     init_loss = ev(prog)
     print(f"start loss: {init_loss:.4g}{' (proxy)' if args.proxy else ' ms'}\n", flush=True)
 
     best = autotune(prog, ev, SearchConfig(
-        iters=args.iters, N=args.every, K=args.k, seed=args.seed, verbose=True,
+        iters=args.iters, N=args.every, K=args.k, depth=args.depth, seed=args.seed,
+        verbose=True, rules=rules, tile_ladder=ladder, couple_tiles=couple,
         run_dir=args.run_dir, resume=args.resume))
 
     best_loss = ev(best)

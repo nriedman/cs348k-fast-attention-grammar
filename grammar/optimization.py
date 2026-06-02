@@ -34,6 +34,8 @@ import tempfile
 import os
 import json
 import pickle
+import signal
+import threading
 import importlib.util
 from dataclasses import dataclass, field
 
@@ -50,6 +52,14 @@ from . import rewrites as R
 # compiles and runs always ranks better than one rejected for memory -- while the
 # +KB term gives a gradient among penalised programs toward smaller footprints.
 MEM_PENALTY_BASE = 1e9
+
+
+class _CompileTimeout(Exception):
+    """Raised when a single compile+first-launch exceeds cfg.compile_timeout."""
+
+
+def _timeout_handler(signum, frame):
+    raise _CompileTimeout()
 
 
 # ==========================================================================
@@ -79,6 +89,18 @@ class EvalConfig:
                                         # score a large, size-proportional penalty so
                                         # the search still descends toward feasibility.
                                         # 0 disables.
+    compile_timeout: float = 0          # seconds; if a single compile+first-launch
+                                        # exceeds this, abandon it and score a penalty
+                                        # (some fusions emit ptxas-hostile kernels that
+                                        # take minutes; healthy compiles are a few
+                                        # seconds, so a 45-60s cap separates them
+                                        # cleanly). The penalised key is cached (and
+                                        # persisted in the snapshot), so the search
+                                        # never retries it. 0 disables. Best-effort:
+                                        # relies on SIGALRM, which interrupts at the
+                                        # next Python/syscall boundary -- it reliably
+                                        # catches subprocess-ptxas stalls but cannot
+                                        # preempt a fully in-process compiler call.
 
 
 class Evaluator:
@@ -90,6 +112,13 @@ class Evaluator:
         self._cache: dict = {}
         self._compiles = 0
         self._runs = 0
+        self.ctx = ""                   # search context prefix for log lines, set by
+                                        # autotune/stage2 (e.g. "it 4 | S2 subtile(matmul,j)")
+
+    @property
+    def _tag(self) -> str:
+        """Per-log-line prefix: '[it 4 | S2 ...]' if context is set, else '[eval]'."""
+        return f"[{self.ctx}]" if self.ctx else "[eval]"
 
     def __call__(self, program: Program) -> float:
         key = structural_key(program)
@@ -110,16 +139,16 @@ class Evaluator:
             # boundary). It is correctly infeasible; report it cleanly rather than
             # as a raw assertion traceback.
             if self.cfg.log:
-                print("[eval] illegal fusion (incompatible tile widths) -> inf",
+                print(f"{self._tag} illegal fusion (incompatible tile widths) -> inf",
                       flush=True)
             return math.inf
         except Exception as e:
             if self.cfg.log:
-                print(f"[eval] emit failed ({type(e).__name__}) -> inf", flush=True)
+                print(f"{self._tag} emit failed ({type(e).__name__}) -> inf", flush=True)
             return math.inf                 # invalid / unrenderable structure
         if self.cfg.log:
             tiles = " ".join(f"{l.out}{tuple(l.tile_shape)}" for l in program.body)
-            print(f"[eval] emit {1e3*(time.perf_counter()-t0):.0f}ms  "
+            print(f"{self._tag} emit {1e3*(time.perf_counter()-t0):.0f}ms  "
                   f"{len(program.body)} stage(s): {tiles}", flush=True)
         if self.cfg.proxy:
             return _proxy_score(program, src)
@@ -142,7 +171,7 @@ class Evaluator:
                 penalty = MEM_PENALTY_BASE + excess / 1024.0   # +1 per KB over budget
                 if self.cfg.log:
                     n_over = sum(1 for k in per_kernel if k > self.cfg.mem_budget)
-                    print(f"[eval] OVER BUDGET max {gmax/1024:.0f}KB > "
+                    print(f"{self._tag} OVER BUDGET max {gmax/1024:.0f}KB > "
                           f"{self.cfg.mem_budget/1024:.0f}KB in {n_over} stage(s), "
                           f"excess {excess/1024:.0f}KB -> penalty {penalty:.0f} "
                           f"(not compiled)", flush=True)
@@ -150,9 +179,18 @@ class Evaluator:
         self._compiles += 1
         try:
             return self._run_gpu(src)
+        except _CompileTimeout:
+            # a ptxas-hostile kernel (e.g. a full-width unsubtiled reduction) that
+            # exceeded the compile budget. Score it as a penalty -- worse than any
+            # real kernel, so the search abandons this rewrite -- and let it cache,
+            # so the config is never recompiled (this run or a resumed one).
+            if self.cfg.log:
+                print(f"{self._tag} COMPILE TIMEOUT (>{self.cfg.compile_timeout:.0f}s) "
+                      f"-> penalty (abandoned, not retried)", flush=True)
+            return MEM_PENALTY_BASE
         except Exception as e:
             if self.cfg.log:
-                print(f"[eval] run FAILED ({type(e).__name__}: {e}) -> inf", flush=True)
+                print(f"{self._tag} run FAILED ({type(e).__name__}: {e}) -> inf", flush=True)
             return math.inf                 # compile or launch failure (e.g. SMEM)
 
     def _run_gpu(self, src: str) -> float:
@@ -165,14 +203,28 @@ class Evaluator:
         args = [rng.randn(*s).astype(cp.float32) for _, s in meta["inputs"]]
         fn = mod.fn
         if log:
-            print(f"[eval]   import+alloc {1e3*(time.perf_counter()-t0):.0f}ms", flush=True)
+            print(f"{self._tag}   import+alloc {1e3*(time.perf_counter()-t0):.0f}ms", flush=True)
         # First launch triggers cuTile JIT compilation of every kernel in the
         # module -- time it separately, since it dominates and is the usual hang.
+        # Guard it with a wall-clock alarm: a pathological fusion can take minutes
+        # to compile, so cap it and abandon (-> _CompileTimeout). Only on the main
+        # thread (setitimer requirement); the autotune loop runs there.
+        timeout = self.cfg.compile_timeout
+        armed = (timeout and hasattr(signal, "SIGALRM")
+                 and threading.current_thread() is threading.main_thread())
         t1 = time.perf_counter()
-        fn(*args)
-        cp.cuda.runtime.deviceSynchronize()
+        if armed:
+            old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+            signal.setitimer(signal.ITIMER_REAL, timeout)
+        try:
+            fn(*args)
+            cp.cuda.runtime.deviceSynchronize()
+        finally:
+            if armed:
+                signal.setitimer(signal.ITIMER_REAL, 0)   # disarm
+                signal.signal(signal.SIGALRM, old_handler)
         if log:
-            print(f"[eval]   JIT compile + first launch "
+            print(f"{self._tag}   JIT compile + first launch "
                   f"{1e3*(time.perf_counter()-t1):.0f}ms", flush=True)
         for _ in range(max(0, self.cfg.warmup - 1)):
             fn(*args)
@@ -189,7 +241,7 @@ class Evaluator:
         # throughput-bound kernel; median still drifts with system jitter.
         best = min(times)
         if log:
-            print(f"[eval]   {self.cfg.iters} timed reps -> min {best:.4g}ms", flush=True)
+            print(f"{self._tag}   {self.cfg.iters} timed reps -> min {best:.4g}ms", flush=True)
         return best
 
 
@@ -236,14 +288,17 @@ def _proxy_score(program: Program, src: str) -> float:
 class TileParam:
     """One tunable tile dimension. `setters` apply a chosen size to every AST
     slot that emits under the same ConstInt name (so coupled knobs stay in sync).
-    `extent` is the axis's global size (its ORIGINAL_DIM)."""
+    `extent` is the axis's global size (its ORIGINAL_DIM). `rungs_src` is the
+    base ladder of candidate sizes (default TILE_LADDER, or an override for the
+    jump-continuity ablation)."""
     name: str
     extent: int
     current: int
     setters: list = field(default_factory=list)        # callables: size -> None
+    rungs_src: tuple = TILE_LADDER
 
     def ladder(self) -> list:
-        rungs = sorted({s for s in TILE_LADDER if s <= self.extent} | {self.extent})
+        rungs = sorted({s for s in self.rungs_src if s <= self.extent} | {self.extent})
         return rungs
 
     def set(self, size: int) -> None:
@@ -268,12 +323,19 @@ def _reduction_loops(loop: ParallelLoop):
     return out
 
 
-def parameter_vector(program: Program) -> list:
+def parameter_vector(program: Program, ladder: tuple | None = None,
+                     couple: bool = False) -> list:
     """Build the tunable tile parameters of `program`, keyed by emitted name.
 
     Output-tile dims emit as TILE_<out>[d]; reduction tiles as RTILE_<out>. An
     axis that is both an output dim and a reduction axis shares one ConstInt, so
-    we group setters under a single name and drive them together."""
+    we group setters under a single name and drive them together.
+
+    Ablation knobs: `ladder` overrides the per-param candidate sizes (a coarse
+    ladder ablates JUMP CONTINUITY). `couple` collapses every tile knob into ONE
+    global parameter whose setters drive all dims together (ablates LOCAL
+    GEOMETRIC CONTROL -- no stage can be tiled independently of the others)."""
+    rungs_src = ladder if ladder is not None else TILE_LADDER
     params: dict[str, TileParam] = {}
 
     def add(name: str, extent: int, current: int, setter) -> None:
@@ -281,7 +343,7 @@ def parameter_vector(program: Program) -> list:
             params[name].setters.append(setter)
             # extent/current should agree across coupled slots; keep the first
         else:
-            params[name] = TileParam(name, extent, current, [setter])
+            params[name] = TileParam(name, extent, current, [setter], rungs_src)
 
     for loop in program.body:
         out = loop.out
@@ -304,7 +366,24 @@ def parameter_vector(program: Program) -> list:
                     RL.tile = v
                 return s
             add(f"RTILE_{out}", ext, rl.tile, make_rsetter())
-    return list(params.values())
+
+    plist = list(params.values())
+    if couple and plist:
+        # LOCAL-CONTROL ABLATION: one global knob drives every dim's setter. Its
+        # extent is the largest axis (so the ladder spans all sizes); setting it
+        # clamps each underlying dim to min(size, that dim's extent) so we never
+        # tile a dim beyond its axis. No stage can be sized independently.
+        all_setters = []
+        for p in plist:
+            ext_p = p.extent
+            for st in p.setters:
+                def clamped(v, _st=st, _e=ext_p):
+                    _st(min(v, _e))
+                all_setters.append(clamped)
+        gext = max(p.extent for p in plist)
+        cur = max(p.current for p in plist)
+        return [TileParam("TILE_GLOBAL", gext, cur, all_setters, rungs_src)]
+    return plist
 
 
 def _reduction_extent(program: Program, rl: ReductionLoop) -> int:
@@ -324,19 +403,43 @@ def _reduction_extent(program: Program, rl: ReductionLoop) -> int:
 # tile dim is moved to its best-improving neighbor on the ladder (adjacent rungs,
 # to stay gradient-flavored). Tile dims interact, so we sweep all coordinates.
 # ==========================================================================
-def stage1_sweep(program: Program, ev: Evaluator) -> tuple[Program, float]:
+def stage1_sweep(program: Program, ev: Evaluator, ladder: tuple | None = None,
+                 couple: bool = False, neighbor: bool = False) -> tuple[Program, float]:
     """One full coordinate sweep over tile parameters. For each tunable tile
-    dimension, evaluate EVERY rung on its ladder and keep the best. All-rungs
-    (not just adjacent) because the ladder is short (4-5 values), so it is cheap
-    and far more thorough: it escapes local bumps and an infeasible (inf) start
-    where the adjacent rung is also infeasible. Mutates a CLONE in place."""
+    dimension, evaluate candidate rungs and keep the best. Mutates a CLONE.
+
+    `neighbor=False`: ALL-RUNGS -- try every rung on the ladder for every param.
+    Thorough but ~ladder-size compiles per param.
+
+    `neighbor=True`: ADAPTIVE. While the program is INFEASIBLE (over the memory
+    budget -> penalty), fall back to all-rungs, because a single adjacent-rung step
+    usually shows NO gradient there: the penalty is the binding stage's excess, and
+    moving one param that doesn't feed that stage leaves the loss flat, so neighbor
+    descent stalls at penalty and never reaches feasibility (verified). Big jumps
+    are needed to find a feasible tiling. Once FEASIBLE, switch to adjacent-rung
+    only (current +- one step): the runtime landscape is smooth enough that cheap
+    neighbor refinement suffices, and over several sweeps (Stage 2 runs every N
+    iterations) the params still traverse the ladder. This confines the expensive
+    all-rungs cost to the brief infeasible phase at the start.
+
+    `ladder`/`couple` carry the jump-continuity / local-control ablation knobs
+    through to parameter_vector."""
     prog = R.clone_program(program)
     R._strip_clone_meta(prog)
-    params = parameter_vector(prog)
+    params = parameter_vector(prog, ladder=ladder, couple=couple)
     best = ev(prog)
+    # adaptive: neighbor steps only once the program is feasible; otherwise the
+    # penalty plateau traps single-rung coordinate moves, so use all-rungs.
+    use_neighbor = neighbor and best < MEM_PENALTY_BASE
     for p in params:
+        rungs = p.ladder()
+        if use_neighbor and p.current in rungs:
+            i = rungs.index(p.current)
+            cands = [rungs[j] for j in (i - 1, i + 1) if 0 <= j < len(rungs)]
+        else:
+            cands = rungs                            # all-rungs (infeasible or off-ladder)
         best_size, best_loss = p.current, best
-        for size in p.ladder():
+        for size in cands:
             if size == p.current:
                 continue
             p.set(size)
@@ -345,6 +448,10 @@ def stage1_sweep(program: Program, ev: Evaluator) -> tuple[Program, float]:
                 best_loss, best_size = loss, size
         p.set(best_size)
         best = best_loss
+        # a param move can flip the program from infeasible to feasible; from then
+        # on within this sweep, switch to cheap neighbor steps.
+        if neighbor and not use_neighbor and best < MEM_PENALTY_BASE:
+            use_neighbor = True
     return prog, best
 
 
@@ -512,56 +619,65 @@ def enumerate_rewrites(program: Program, rules) -> list:
     return out
 
 
-def stage2_step(program: Program, ev: Evaluator, K: int, rules, rng: random.Random
-                ) -> tuple[Program, float, list]:
-    """Sample K applicable rewrites, trial each (apply + one Stage-1 sweep), then
-    apply all non-worsening best-first -- re-resolving each against the evolving
-    program and skipping any whose precondition no longer holds. Because
-    descriptors re-resolve (rather than replay stale-node closures), several
-    rewrites can land in one step.
+def stage2_step(program: Program, ev: Evaluator, K: int, rules, rng: random.Random,
+                ladder: tuple | None = None, couple: bool = False, depth: int = 1,
+                it: int = 0) -> tuple[Program, float, list]:
+    """A depth-bounded greedy rewrite chain. For each of `depth` links: sample K
+    applicable rewrites, NEIGHBOR-tune each to rank it cheaply, and commit the
+    single best non-worsening one. Stop early if no rewrite is non-worsening.
 
-    Guard: each trial is non-worsening ALONE, but the combination can regress
-    (e.g. two rewrites that are each fine separately together push a tile back
-    over the memory budget, or one undoes the feasibility the other enabled). So
-    after building the combination we evaluate it and, if it is worse than the
-    best individual accepted trial, fall back to that single trial. This
-    guarantees stage 2's committed program is at least as good as its best trial
-    -- i.e. if ANY trial compiled, the committed program compiles."""
-    base_loss = stage1_sweep(program, ev)[1]
-    menu = enumerate_rewrites(program, rules)
-    if not menu:
-        return program, base_loss, []
-    sample = rng.sample(menu, min(K, len(menu)))
+    `depth=1` (default, fast): commit one rewrite per Stage-2 step. `depth=2`:
+    explore a second rewrite ON TOP of the first (a 2-step lookahead) -- finds
+    pairs where the first move only pays off after the second, at depth*K trials.
 
-    trials = []                                  # (delta, rewrite)
-    best_trial = None                            # (loss, tuned_prog, label, delta)
-    for rw in sample:
-        cand = rw.resolve(program)               # apply to a fresh clone
-        if cand is None:
-            continue
-        tuned, loss = stage1_sweep(cand, ev)     # judge the move WITH a re-tune
-        if loss <= base_loss:                    # accept non-worsening (enabling moves)
-            trials.append((base_loss - loss, rw))
-            if best_trial is None or loss < best_trial[0]:
-                best_trial = (loss, tuned, rw.label, base_loss - loss)
-
-    trials.sort(key=lambda t: -t[0])             # best improvement first
-    applied = []
+    Everything is neighbor-tuned (matching Stage 1), so the cost per step is
+    depth*K cheap adjacent-rung sweeps rather than K full all-rungs sweeps. The
+    committed program is exactly the best accepted trial, so the chain is
+    monotonically non-worsening and 'if any trial compiled, the commit compiles'
+    holds by construction (no separate combination/fallback needed)."""
+    verbose_log = ev.cfg.log
     prog = program
-    for delta, rw in trials:
-        cand = rw.resolve(prog)                  # re-resolve against current tree
-        if cand is None:
-            continue                             # precondition no longer holds here
-        prog = cand
-        applied.append((rw.label, delta))
-
-    # tune the committed combination; fall back to the best single trial if the
-    # combination regressed below it (so a good single rewrite is never lost to a
-    # bad combination).
-    combo, combo_loss = stage1_sweep(prog, ev)
-    if best_trial is not None and best_trial[0] < combo_loss:
-        return best_trial[1], best_trial[0], [(best_trial[2], best_trial[3])]
-    return combo, combo_loss, applied
+    applied = []
+    ev.ctx = f"it {it} | S2 base-tune"
+    cur_loss = stage1_sweep(prog, ev, ladder, couple, neighbor=True)[1]
+    for d in range(max(1, depth)):
+        menu = enumerate_rewrites(prog, rules)
+        if not menu:
+            break
+        sample = rng.sample(menu, min(K, len(menu)))
+        if verbose_log:
+            link = f" (chain link {d + 1}/{depth})" if depth > 1 else ""
+            print(f"\n{'=' * 8} it {it} | STAGE 2{link}: ranking {len(sample)} "
+                  f"rewrite(s), base loss {cur_loss:.4g} {'=' * 8}", flush=True)
+        best = None                              # (loss, tuned_prog, label, delta)
+        for rw in sample:
+            cand = rw.resolve(prog)
+            if cand is None:
+                if verbose_log:
+                    print(f"  -- rewrite {rw.label}: precondition no longer holds, "
+                          f"skipped", flush=True)
+                continue
+            if verbose_log:
+                print(f"  -- trying rewrite: {rw.label}", flush=True)
+            ev.ctx = f"it {it} | S2 try {rw.label}"
+            tuned, loss = stage1_sweep(cand, ev, ladder, couple, neighbor=True)
+            if verbose_log:
+                verdict = "ACCEPT" if loss <= cur_loss else "reject"
+                print(f"     {rw.label} -> {loss:.4g} ({verdict}, base {cur_loss:.4g})",
+                      flush=True)
+            if loss <= cur_loss and (best is None or loss < best[0]):
+                best = (loss, tuned, rw.label, cur_loss - loss)
+        if best is None:
+            if verbose_log:
+                print(f"  no non-worsening rewrite found -> chain stops", flush=True)
+            break                                # no non-worsening rewrite -> stop chain
+        if verbose_log:
+            print(f"  >> committing {best[2]}  (loss {cur_loss:.4g} -> {best[0]:.4g})",
+                  flush=True)
+        prog = best[1]                           # commit the best accepted (neighbor-tuned)
+        applied.append((best[2], best[3]))
+        cur_loss = best[0]
+    return prog, cur_loss, applied
 
 
 # ==========================================================================
@@ -684,13 +800,27 @@ def _jsonable(v):
 @dataclass
 class SearchConfig:
     iters: int = 30
-    N: int = 2                                   # run Stage 2 every N iterations
+    N: int = 4                                   # run Stage 2 every N iterations.
+                                                 # With neighbor Stage-1 sweeps, the
+                                                 # N-1 param iterations between rewrites
+                                                 # let tiles cross the whole ladder.
     K: int = 6                                   # rewrites sampled per Stage-2 step
+    depth: int = 1                               # rewrites chained per Stage-2 step
+                                                 # (1 = one move; 2 = a 2-step lookahead)
     rules: tuple = DEFAULT_RULES
     seed: int = 0
     verbose: bool = True
     run_dir: str | None = None                   # if set, write log + snapshots here
     resume: bool = False                          # resume from run_dir/snapshot.pkl
+    # --- Design-for-Descent ablation knobs (parameter-space) ---
+    tile_ladder: tuple | None = None              # override the tile-size ladder.
+                                                  # None => default fine ladder. A coarse
+                                                  # ladder (e.g. (16,)) makes every move a
+                                                  # large jump -> ablates JUMP CONTINUITY.
+    couple_tiles: bool = False                    # if True, ALL tile knobs collapse into
+                                                  # one global size -> no independent
+                                                  # per-stage control -> ablates LOCAL
+                                                  # GEOMETRIC CONTROL.
 
 
 def _better(loss: float, best: float) -> bool:
@@ -733,7 +863,9 @@ def autotune(program: Program, ev: Evaluator | None = None,
             print(f"[resume] from iter {st['iteration']} best={best_loss:.4g}")
     else:
         rng = random.Random(cfg.seed)
-        program, loss = stage1_sweep(program, ev)        # initial tune
+        ev.ctx = "init | S1"
+        program, loss = stage1_sweep(program, ev, cfg.tile_ladder, cfg.couple_tiles,
+                                       neighbor=True)  # initial tune (neighbor)
         best_prog, best_loss = R.clone_program(program), loss
         R._strip_clone_meta(best_prog)
         start_it = 1
@@ -749,11 +881,23 @@ def autotune(program: Program, ev: Evaluator | None = None,
 
     for it in range(start_it, cfg.iters + 1):
         applied = []
-        if it % cfg.N == 0:
-            program, _, applied = stage2_step(program, ev, cfg.K, cfg.rules, rng)
+        is_s2 = it % cfg.N == 0
+        if cfg.verbose:
+            kind = "STAGE 2 (rewrite) + STAGE 1 (tune)" if is_s2 else "STAGE 1 (tune only)"
+            print(f"\n{'#' * 60}\n# ITERATION {it}/{cfg.iters} -- {kind}\n{'#' * 60}",
+                  flush=True)
+        if is_s2:
+            program, _, applied = stage2_step(program, ev, cfg.K, cfg.rules, rng,
+                                              cfg.tile_ladder, cfg.couple_tiles,
+                                              cfg.depth, it)
             if cfg.verbose and applied:
                 print(f"[it {it}] applied {[a for a, _ in applied]}")
-        program, loss = stage1_sweep(program, ev)    # tune (after rewrite, or refine)
+        if cfg.verbose:
+            print(f"\n----- it {it} | STAGE 1: refine tiles "
+                  f"(neighbor sweep) -----", flush=True)
+        ev.ctx = f"it {it} | S1"
+        program, loss = stage1_sweep(program, ev, cfg.tile_ladder, cfg.couple_tiles,
+                                       neighbor=True)  # tune (neighbor)
         # best-tracking is over the ACCEPTED path only: the program the search
         # commits to each iteration. A program tuned inside a rejected Stage-2
         # trial is deliberately NOT recorded -- the search walked away from it.
