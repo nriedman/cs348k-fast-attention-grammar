@@ -1,6 +1,6 @@
 {
   "search": {
-    "iters": 64,
+    "iters": 32,
     "N": 4,
     "K": 5,
     "depth": 1,
@@ -16,7 +16,7 @@
     "seed": 0,
     "verbose": true,
     "run_dir": "runs/attn_full",
-    "resume": false,
+    "resume": true,
     "tile_ladder": null,
     "couple_tiles": false
   },

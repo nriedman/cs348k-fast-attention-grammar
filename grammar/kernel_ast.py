@@ -1042,6 +1042,71 @@ def kernel_peak_tile_bytes(program: Program, shapes: dict[int, Shape] | None = N
     return out
 
 
+def kernel_compile_risk(program: Program, shapes: dict[int, Shape] | None = None
+                        ) -> list[int]:
+    """Cheap, no-compile estimate of ptxas compile difficulty for EACH kernel.
+
+    The observed slow compiles (minutes vs the usual few seconds) all share one
+    shape: a kernel does a reduction/contraction over a LARGE axis as STRAIGHT-LINE
+    work -- not folded into a sub-tiling ReductionLoop runtime loop -- so ptxas has
+    to schedule a deep unrolled body. Two forms:
+
+      * a matmul NOT inside a ReductionLoop: its full contraction K is materialised
+        in one shot (the (TS, K) operand). Cost ~ K. (e.g. atomic O=P@V over j=512.)
+      * a row-reduce (rowsum/rowmax) NOT inside a ReductionLoop whose result is
+        broadcast back into a WIDE output in the SAME kernel -- the fused
+        reduction+broadcast keeps the wide (TS, D) tile live across both, which
+        blows up register allocation. Cost ~ the reduced extent D. (e.g.
+        merge(sm,P): rowsum over j=512 fused with the e/sm division.)
+
+    The crucial discriminations, which a raw tile-volume or FLOP proxy gets wrong:
+      - a row-reduce with a NARROW (collapsed [N,1]) output -- a plain rowmax/rowsum
+        stage -- is NOT risky (ptxas handles a reduction-to-scalar fine); only the
+        fused-into-wide-output form is. So we require the kernel's output tensor to
+        be a full matrix (no collapsed dim), which mx/sm are not.
+      - a matmul over a SMALL contraction (e.g. the QK matmul over d=64) is NOT
+        risky, so the cost is the contraction extent itself, thresholded by caller.
+      - once a matmul/reduce IS sub-tiled (wrapped in a ReductionLoop), the heavy
+        axis becomes a runtime loop of width TS_k, so it stops counting here --
+        which is exactly the repair the search should make.
+
+    Returns the per-kernel risk (largest straight-line reduction/contraction
+    extent), one entry per stage. The caller penalises a program whose max exceeds
+    a threshold, without compiling it."""
+    if shapes is None:
+        shapes = _infer_program(program)
+
+    def _straightline_computes(loop):
+        # Computes in the kernel body that are NOT inside a ReductionLoop (i.e.
+        # their heavy axis is materialised, not folded into a runtime loop).
+        out = []
+        for s in loop.body:
+            if isinstance(s, Compute):
+                out.append(s)
+            elif isinstance(s, SpatialLoop):
+                out.extend(c for c in s.body if isinstance(c, Compute))
+            # ReductionLoop bodies are deliberately skipped: their axis is a loop.
+        return out
+
+    risks = []
+    for loop in program.body:
+        out_shape = program.tensors[loop.out]
+        wide_output = sum(1 for d in out_shape if d > 1) >= 2   # full matrix, not [N,1]
+        risk = 0
+        for c in _straightline_computes(loop):
+            if c.op == "matmul":
+                inp0 = c.inputs[0]
+                k = (program.tensors[inp0.source][-1] if isinstance(inp0, Load)
+                     else shapes.get(id(inp0), (1,))[-1])
+                risk = max(risk, k)
+            elif c.op in ROW_REDUCE_OPS and wide_output:
+                # fused reduction broadcast back into a wide output
+                red = _axis_global_extent(c, c.axis, program.tensors)
+                risk = max(risk, red)
+        risks.append(risk)
+    return risks
+
+
 def program_flops(program: Program, shapes: dict[int, Shape] | None = None):
     """Total FLOPs from the AST. Exact for matmul, pointwise ops, and row
     reductions; if any op has no rule, returns exact=False so callers can

@@ -1,0 +1,82 @@
+{
+  "search": {
+    "iters": 2048,
+    "N": 4,
+    "K": 5,
+    "depth": 1,
+    "rules": [
+      "hoist",
+      "sink",
+      "subtile_reduction",
+      "unwrap_reduction",
+      "merge",
+      "merge_reductions",
+      "reorder"
+    ],
+    "seed": 0,
+    "verbose": true,
+    "run_dir": "runs/attn_full_long",
+    "resume": false,
+    "tile_ladder": null,
+    "couple_tiles": false
+  },
+  "start_stages": [
+    [
+      "S",
+      [
+        2048,
+        2048
+      ]
+    ],
+    [
+      "Ss",
+      [
+        2048,
+        2048
+      ]
+    ],
+    [
+      "mx",
+      [
+        2048,
+        2048
+      ]
+    ],
+    [
+      "sb",
+      [
+        2048,
+        2048
+      ]
+    ],
+    [
+      "e",
+      [
+        2048,
+        2048
+      ]
+    ],
+    [
+      "sm",
+      [
+        2048,
+        2048
+      ]
+    ],
+    [
+      "P",
+      [
+        2048,
+        2048
+      ]
+    ],
+    [
+      "O",
+      [
+        2048,
+        64
+      ]
+    ]
+  ],
+  "start_source": "import cuda.tile as ct\nimport cupy as cp\nimport numpy as np\n\nConstInt = ct.Constant[int]\n\n# --- tunable tile sizes (vary these to autotune) ---\nTILE_S = (2048, 2048)\nTILE_Ss = (2048, 2048)\nTILE_mx = (2048, 2048)\nTILE_sb = (2048, 2048)\nTILE_e = (2048, 2048)\nTILE_sm = (2048, 2048)\nTILE_P = (2048, 2048)\nTILE_O = (2048, 64)\n\n@ct.kernel\ndef S_kernel(Q, KT, S, DD: ConstInt, I: ConstInt, J: ConstInt):\n    i = ct.bid(0)\n    j = ct.bid(1)\n    t1 = ct.load(Q, (0, 0), (I, DD))\n    t2 = ct.load(KT, (0, 0), (DD, J))\n    t3 = ct.matmul(t1, t2)\n    ct.store(S, (0, 0), t3)\n\n@ct.kernel\ndef Ss_kernel(S, Ss, I: ConstInt, J: ConstInt):\n    i = ct.bid(0)\n    j = ct.bid(1)\n    t1 = ct.load(S, (0, 0), (I, J))\n    t2 = (t1 * 0.125)\n    ct.store(Ss, (0, 0), t2)\n\n@ct.kernel\ndef mx_kernel(Ss, mx, I: ConstInt, J: ConstInt):\n    i = ct.bid(0)\n    j = ct.bid(1)\n    t1 = ct.load(Ss, (0, 0), (I, J))\n    t2 = ct.max(t1, axis=1, keepdims=True)\n    ct.store(mx, (0, 0), t2)\n\n@ct.kernel\ndef sb_kernel(Ss, mx, sb, I: ConstInt, J: ConstInt):\n    i = ct.bid(0)\n    j = ct.bid(1)\n    t1 = ct.load(Ss, (0, 0), (I, J))\n    t2 = ct.load(mx, (0, 0), (I, 1))\n    t3 = (t1 - t2)\n    ct.store(sb, (0, 0), t3)\n\n@ct.kernel\ndef e_kernel(sb, e, I: ConstInt, J: ConstInt):\n    i = ct.bid(0)\n    j = ct.bid(1)\n    t1 = ct.load(sb, (0, 0), (I, J))\n    t2 = ct.exp(t1)\n    ct.store(e, (0, 0), t2)\n\n@ct.kernel\ndef sm_kernel(e, sm, I: ConstInt, J: ConstInt):\n    i = ct.bid(0)\n    j = ct.bid(1)\n    t1 = ct.load(e, (0, 0), (I, J))\n    t2 = ct.sum(t1, axis=1, keepdims=True)\n    ct.store(sm, (0, 0), t2)\n\n@ct.kernel\ndef P_kernel(e, sm, P, I: ConstInt, J: ConstInt):\n    i = ct.bid(0)\n    j = ct.bid(1)\n    t1 = ct.load(e, (0, 0), (I, J))\n    t2 = ct.load(sm, (0, 0), (I, 1))\n    t3 = (t1 / t2)\n    ct.store(P, (0, 0), t3)\n\n@ct.kernel\ndef O_kernel(P, V, O, DD: ConstInt, I: ConstInt, J: ConstInt):\n    i = ct.bid(0)\n    dd = ct.bid(1)\n    t1 = ct.load(P, (0, 0), (I, J))\n    t2 = ct.load(V, (0, 0), (J, DD))\n    t3 = ct.matmul(t1, t2)\n    ct.store(O, (0, 0), t3)\n\ndef fn(KT, Q, V):\n    dtype = KT.dtype\n    stream = cp.cuda.get_current_stream()\n    P = cp.zeros((2048, 2048), dtype=dtype)\n    S = cp.zeros((2048, 2048), dtype=dtype)\n    Ss = cp.zeros((2048, 2048), dtype=dtype)\n    e = cp.zeros((2048, 2048), dtype=dtype)\n    mx = cp.zeros((2048, 1), dtype=dtype)\n    sb = cp.zeros((2048, 2048), dtype=dtype)\n    sm = cp.zeros((2048, 1), dtype=dtype)\n    O = cp.zeros((2048, 64), dtype=dtype)\n    grid = (ct.cdiv(S.shape[0], TILE_S[0]), ct.cdiv(S.shape[1], TILE_S[1]), 1)\n    ct.launch(stream, grid, S_kernel, (Q, KT, S, 64, 2048, 2048))\n    grid = (ct.cdiv(Ss.shape[0], TILE_Ss[0]), ct.cdiv(Ss.shape[1], TILE_Ss[1]), 1)\n    ct.launch(stream, grid, Ss_kernel, (S, Ss, 2048, 2048))\n    grid = (ct.cdiv(mx.shape[0], TILE_mx[0]), ct.cdiv(mx.shape[1], TILE_mx[1]), 1)\n    ct.launch(stream, grid, mx_kernel, (Ss, mx, 2048, 2048))\n    grid = (ct.cdiv(sb.shape[0], TILE_sb[0]), ct.cdiv(sb.shape[1], TILE_sb[1]), 1)\n    ct.launch(stream, grid, sb_kernel, (Ss, mx, sb, 2048, 2048))\n    grid = (ct.cdiv(e.shape[0], TILE_e[0]), ct.cdiv(e.shape[1], TILE_e[1]), 1)\n    ct.launch(stream, grid, e_kernel, (sb, e, 2048, 2048))\n    grid = (ct.cdiv(sm.shape[0], TILE_sm[0]), ct.cdiv(sm.shape[1], TILE_sm[1]), 1)\n    ct.launch(stream, grid, sm_kernel, (e, sm, 2048, 2048))\n    grid = (ct.cdiv(P.shape[0], TILE_P[0]), ct.cdiv(P.shape[1], TILE_P[1]), 1)\n    ct.launch(stream, grid, P_kernel, (e, sm, P, 2048, 2048))\n    grid = (ct.cdiv(O.shape[0], TILE_O[0]), ct.cdiv(O.shape[1], TILE_O[1]), 1)\n    ct.launch(stream, grid, O_kernel, (P, V, O, 64, 2048, 2048))\n    return O\n\nKERNEL_META = {'inputs': [['KT', [64, 2048]], ['Q', [2048, 64]], ['V', [2048, 64]]], 'output': ['O', [2048, 64]], 'flops': 1098907648, 'flops_exact': True}\n\nif __name__ == \"__main__\":\n    args = [cp.random.randn(*s, dtype=cp.float32) for _, s in KERNEL_META[\"inputs\"]]\n    out = fn(*args)\n    cp.cuda.runtime.deviceSynchronize()\n    print(\"ran:\", KERNEL_META[\"inputs\"], \"->\", list(out.shape))\n"
+}

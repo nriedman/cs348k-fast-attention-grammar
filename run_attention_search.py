@@ -208,6 +208,12 @@ def main():
                          "this. Healthy compiles are a few seconds, so 45-60 cleanly "
                          "catches ptxas-hostile fusions without touching good ones. "
                          "0 disables.")
+    ap.add_argument("--max-compile-risk", type=int, default=256, dest="max_compile_risk",
+                    help="static no-compile gate: largest straight-line reduction/"
+                         "contraction extent a kernel may have. Catches full-K matmuls "
+                         "and reduction-into-wide-output fusions INSTANTLY (no 45s wait); "
+                         "the repair is to sub-tile. 256 passes d=64 QK, catches j=512. "
+                         "0 disables.")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -220,7 +226,8 @@ def main():
     ev = Evaluator(EvalConfig(warmup=args.warmup, iters=args.reps,
                               proxy=args.proxy, seed=args.seed, log=args.log,
                               mem_budget=args.mem_budget_kb * 1024,
-                              compile_timeout=args.compile_timeout))
+                              compile_timeout=args.compile_timeout,
+                              max_compile_risk=args.max_compile_risk))
 
     print(f"task: scaled dot-product attention   Q[{args.n},{args.d}] "
           f"K[{args.n},{args.d}] V[{args.n},{args.d}]  fp32")

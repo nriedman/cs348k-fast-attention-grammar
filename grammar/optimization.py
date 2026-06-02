@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from .kernel_ast import (
     Program, ParallelLoop, ReductionLoop, SpatialLoop, Load, Store, Compute,
     emit_module, structural_key, peak_tile_bytes, kernel_peak_tile_bytes,
-    program_flops,
+    kernel_compile_risk, program_flops,
 )
 from . import rewrites as R
 
@@ -101,6 +101,15 @@ class EvalConfig:
                                         # next Python/syscall boundary -- it reliably
                                         # catches subprocess-ptxas stalls but cannot
                                         # preempt a fully in-process compiler call.
+    max_compile_risk: int = 256         # cheap STATIC pre-check (no compile): the
+                                        # largest straight-line reduction/contraction
+                                        # extent a kernel may have. A full-K matmul or
+                                        # a reduction fused into a wide output above
+                                        # this is refused and penalised instantly,
+                                        # instead of waiting out compile_timeout. 256
+                                        # passes the d=64 QK matmul but catches the
+                                        # j=512 O matmul and softmax-row fusions; the
+                                        # repair is to sub-tile. 0 disables.
 
 
 class Evaluator:
@@ -175,6 +184,28 @@ class Evaluator:
                           f"{self.cfg.mem_budget/1024:.0f}KB in {n_over} stage(s), "
                           f"excess {excess/1024:.0f}KB -> penalty {penalty:.0f} "
                           f"(not compiled)", flush=True)
+                return penalty
+        # Compile-risk pre-check: like the memory check, a cheap no-compile gate,
+        # but for ptxas TIME rather than SMEM. A kernel with a straight-line
+        # reduction/contraction over a large axis (a full-K matmul, or a reduction
+        # fused into a wide output) compiles in minutes, not seconds. We refuse to
+        # compile it and penalise instead, so the search abandons it instantly
+        # rather than after a timeout. The repair is to sub-tile the heavy axis
+        # (which folds it into a runtime loop, dropping the risk to ~0) -- exactly
+        # the move the grammar should make. Penalty mirrors the memory one: a base
+        # plus a per-kernel excess so each risky stage gets a descent gradient.
+        if self.cfg.max_compile_risk:
+            per_kernel = kernel_compile_risk(program)
+            rmax = max(per_kernel) if per_kernel else 0
+            if rmax > self.cfg.max_compile_risk:
+                excess = sum(max(0, r - self.cfg.max_compile_risk) for r in per_kernel)
+                penalty = MEM_PENALTY_BASE + excess        # already in "axis units"
+                if self.cfg.log:
+                    n_over = sum(1 for r in per_kernel if r > self.cfg.max_compile_risk)
+                    print(f"{self._tag} COMPILE RISK max depth {rmax} > "
+                          f"{self.cfg.max_compile_risk} in {n_over} stage(s) "
+                          f"-> penalty {penalty:.0f} (not compiled; sub-tile to repair)",
+                          flush=True)
                 return penalty
         self._compiles += 1
         try:
@@ -566,9 +597,29 @@ def _mk(kind, label, program, *nodes, **kw):
     return Rewrite(label, resolve)
 
 
-def enumerate_rewrites(program: Program, rules) -> list:
+def _risk_excess(program: Program, threshold: int) -> int:
+    """Sum of per-kernel compile-risk over the threshold (0 if all within)."""
+    if not threshold:
+        return 0
+    return sum(max(0, r - threshold) for r in kernel_compile_risk(program))
+
+
+def enumerate_rewrites(program: Program, rules, max_risk: int = 0) -> list:
     """Every applicable rewrite as a path-addressed Rewrite descriptor (its
-    precondition currently holds)."""
+    precondition currently holds).
+
+    With max_risk > 0, the COMPILE-RISK check is folded in as an extra precondition:
+    a rewrite is dropped from the menu if its result would be compile-risky and does
+    not reduce the program's risk-excess. Because compile-risk is TILE-INVARIANT
+    (it is set by global axis extents and loop structure, not tile sizes), no
+    Stage-1 tuning could rescue such a result -- it would just be penalised -- so
+    excluding it is lossless and stops it from wasting a sampled rewrite slot. (The
+    MEMORY check is deliberately NOT folded in: it is tile-DEPENDENT, so an
+    over-budget result can be repaired by the sweep shrinking tiles, and dropping
+    it pre-sweep would lose rewrites the search could fix.) Risk-excess is compared
+    as a SUM (per the memory-penalty rationale): a rewrite is kept if its result is
+    risk-clean OR strictly reduces the excess, so fixing one of several risky stages
+    is never blocked."""
     out = []
     all_stmts = [s for loop in program.body for s in _iter_stmts(loop.body)]
 
@@ -616,6 +667,19 @@ def enumerate_rewrites(program: Program, rules) -> list:
             for a, b in zip(sibs, sibs[1:]):
                 if R.can_reorder(program, a, b)[0]:
                     out.append(_mk("reorder", "reorder(stmt)", program, a, b))
+
+    # COMPILE-RISK precondition (tile-invariant -> safe to filter pre-tuning).
+    if max_risk:
+        cur_excess = _risk_excess(program, max_risk)
+        live = []
+        for rw in out:
+            cand = rw.resolve(program)
+            if cand is None:
+                continue
+            cand_excess = _risk_excess(cand, max_risk)
+            if cand_excess == 0 or cand_excess < cur_excess:
+                live.append(rw)          # risk-clean, or makes progress on the excess
+        return live
     return out
 
 
@@ -641,7 +705,7 @@ def stage2_step(program: Program, ev: Evaluator, K: int, rules, rng: random.Rand
     ev.ctx = f"it {it} | S2 base-tune"
     cur_loss = stage1_sweep(prog, ev, ladder, couple, neighbor=True)[1]
     for d in range(max(1, depth)):
-        menu = enumerate_rewrites(prog, rules)
+        menu = enumerate_rewrites(prog, rules, ev.cfg.max_compile_risk)
         if not menu:
             break
         sample = rng.sample(menu, min(K, len(menu)))
